@@ -69,7 +69,6 @@ export function makeGround(opts = {}) {
     const r = Math.hypot(x - hub[0], z - hub[1]), c = smoothstep(padO.outer, padO.inner, r);
     let h = H0(x, z);
     if (c > 0) h = lerp(h, Hc + 0.03 * Ln(x * 0.5, z * 0.5, 1), c);
-    // BIBLE 把"边界抬升"写在修路之后；因 lerp(a+b, g+b, w) = lerp(a, g, w) + b，把它并入 Hpre 结果等价，且让路面 LUT(grade) 与最终路面一致
     return boundAmp > 0 && r > 170 ? h + boundAmp * smoothstep(170, 240, r) * (0.6 + 0.4 * Ln(x * 0.01, z * 0.01, 1)) : h;
   };
   // ── 道路 LUT：0.5 m 采样 (x,z,s,grade)，grade 为沿线高度经 12 m 箱式滤波

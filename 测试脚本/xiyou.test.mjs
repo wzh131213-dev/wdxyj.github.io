@@ -1,10 +1,10 @@
 // xiyou.test.mjs — 零依赖测试：node xiyou.test.mjs（Node ≥ 20）。失败时进程退出码为 1。
 // 每个板块都含：核心业务场景 / 边界条件(极值) / 异常输入。THREE 适配层用最小 stub 验证调用逻辑（沙箱无网络、无真实 three.js）。
 import assert from 'node:assert/strict';
-import * as C from './xiyou-core.js';
-import * as CH from './xiyou-character.js';
-import * as W from './xiyou-world.js';
-import * as TH from './xiyou-three.js';
+import * as C from '../xiyou-core.js';
+import * as CH from '../xiyou-character.js';
+import * as W from '../xiyou-world.js';
+import * as TH from '../xiyou-three.js';
 
 let pass = 0, fail = 0;
 const fails = [];

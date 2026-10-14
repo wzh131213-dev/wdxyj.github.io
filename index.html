@@ -3738,12 +3738,87 @@ function toGeometry(THREE, m, { skinned = false } = {}) {
 /** 材质描述 → THREE 材质。opts.materialFactory(spec) 可返回自定义材质（例如你项目里的 patchMaterial）；返回空则走默认 */
 function makeMaterial(THREE, spec, opts = {}) {
   if (opts.materialFactory) { const custom = opts.materialFactory(spec); if (custom) return custom; }
-  const physical = spec.kind === 'cloth' && spec.sheen > 0 && THREE.MeshPhysicalMaterial;
-  const Cls = physical || THREE.MeshStandardMaterial;
-  const mat = new Cls({ roughness: spec.roughness ?? 0.8, metalness: spec.metalness ?? 0, side: spec.side === 'double' ? THREE.DoubleSide : THREE.FrontSide, vertexColors: !!spec.vertexColors });
-  mat.color.setRGB(spec.color[0], spec.color[1], spec.color[2]);
-  if (physical) { mat.sheen = spec.sheen; mat.sheenColor.setRGB(...spec.sheenColor); mat.sheenRoughness = 0.5; }
-  mat.name = spec.kind;
+  const kind = spec.kind;
+  let mat;
+
+  if (kind === 'metal') {
+    mat = new THREE.MeshStandardMaterial({
+      metalness: spec.metalness ?? 0.92,
+      roughness: spec.roughness ?? 0.22,
+      side: spec.side === 'double' ? THREE.DoubleSide : THREE.FrontSide,
+      vertexColors: !!spec.vertexColors
+    });
+    if (opts.envMap || THREE.defaultEnvMap) {
+      mat.envMap = opts.envMap || THREE.defaultEnvMap;
+      mat.envMapIntensity = opts.envMapIntensity ?? 1.2;
+    }
+  } else if (kind === 'cloth' || kind === 'kasaya' || kind === 'robe') {
+    const Cls = THREE.MeshPhysicalMaterial || THREE.MeshStandardMaterial;
+    mat = new Cls({
+      roughness: spec.roughness ?? 0.85,
+      metalness: spec.metalness ?? 0,
+      side: spec.side === 'double' ? THREE.DoubleSide : THREE.FrontSide,
+      vertexColors: !!spec.vertexColors
+    });
+    if (mat.isMeshPhysicalMaterial) {
+      mat.sheen = spec.sheen ?? 0.7;
+      const sc = spec.sheenColor ?? [0.9, 0.85, 0.8];
+      if (mat.sheenColor && typeof mat.sheenColor.setRGB === 'function') {
+        mat.sheenColor.setRGB(sc[0], sc[1], sc[2]);
+      } else {
+        const ColorCls = THREE.Color || class { constructor(r, g, b) { this.r = r; this.g = g; this.b = b; } };
+        mat.sheenColor = new ColorCls(sc[0], sc[1], sc[2]);
+      }
+      mat.sheenRoughness = spec.sheenRoughness ?? 0.5;
+    }
+  } else if (kind === 'skin' || kind === 'hair') {
+    const Cls = THREE.MeshStandardMaterial;
+    mat = new Cls({
+      roughness: kind === 'skin' ? (spec.roughness ?? 0.6) : (spec.roughness ?? 0.8),
+      metalness: spec.metalness ?? 0,
+      side: spec.side === 'double' ? THREE.DoubleSide : THREE.FrontSide,
+      vertexColors: !!spec.vertexColors
+    });
+    if (opts.proceduralNormalMap) {
+      mat.normalMap = opts.proceduralNormalMap;
+      mat.normalScale = new THREE.Vector2(0.15, 0.15);
+    }
+  } else {
+    const Cls = (spec.sheen > 0 && THREE.MeshPhysicalMaterial) || THREE.MeshStandardMaterial;
+    mat = new Cls({
+      roughness: spec.roughness ?? 0.8,
+      metalness: spec.metalness ?? 0,
+      side: spec.side === 'double' ? THREE.DoubleSide : THREE.FrontSide,
+      vertexColors: !!spec.vertexColors
+    });
+    if (mat.isMeshPhysicalMaterial && spec.sheen > 0) {
+      mat.sheen = spec.sheen;
+      const sc = spec.sheenColor ?? [0.9, 0.85, 0.8];
+      if (mat.sheenColor && typeof mat.sheenColor.setRGB === 'function') {
+        mat.sheenColor.setRGB(sc[0], sc[1], sc[2]);
+      } else {
+        const ColorCls = THREE.Color || class { constructor(r, g, b) { this.r = r; this.g = g; this.b = b; } };
+        mat.sheenColor = new ColorCls(sc[0], sc[1], sc[2]);
+      }
+      mat.sheenRoughness = 0.5;
+    }
+  }
+
+  if (spec.color) {
+    if (mat.color && typeof mat.color.setRGB === 'function') {
+      mat.color.setRGB(spec.color[0], spec.color[1], spec.color[2]);
+    } else if (mat.color && typeof mat.color.set === 'function') {
+      mat.color.set(spec.color[0], spec.color[1], spec.color[2]);
+    } else if (mat.color && typeof mat.color === 'object') {
+      mat.color.r = spec.color[0];
+      mat.color.g = spec.color[1];
+      mat.color.b = spec.color[2];
+    } else {
+      const ColorCls = THREE.Color || class { constructor(r, g, b) { this.r = r; this.g = g; this.b = b; } };
+      mat.color = new ColorCls(spec.color[0], spec.color[1], spec.color[2]);
+    }
+  }
+  mat.name = kind || 'material';
   return mat;
 }
 
@@ -4044,18 +4119,23 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         const kind = XM_CFG.enabled ? XM_CFG.figures[character.id] : undefined;
         if (kind) {
             try {
-                const baked = getBakedFigure(kind, !!options.ride);
-                const figure = XM.createStaticCharacter(THREE, baked, { castShadow: true });
+                let data = XM.buildCharacterData({ kind });
+                if (options.ride) {
+                    data = XM.poseData(data, XM.RIDE_POSE);
+                }
+                const figure = XM.createCharacter(THREE, data, { castShadow: true });
                 figure.group.scale.setScalar(XM_CFG.unit);
                 inner.add(figure.group);
+                outer.userData.characterHandle = figure;
+                outer.userData.bones = figure.bones;
                 usedNew = true;
                 if (options.ride) {
                     const seat =
-                        (baked.layout.hipY - 0.10 * baked.layout.k) * XM_CFG.unit * scale;
+                        (data.layout.hipY - 0.10 * data.layout.k) * XM_CFG.unit * scale;
                     outer.userData.rideY = XM_CFG.saddleTop - XM_CFG.anchorY - seat;
                 }
             } catch (error) {
-                console.error("新人物模型生成失败，已回退旧模型：", character.id, error);
+                console.error("新人物动态模型生成失败，已回退旧模型：", character.id, error);
             }
         }
         if (!usedNew) {
@@ -4991,7 +5071,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
 
     const player = {
         position: new THREE.Vector3(0, 0, 0),
-        velocity: new THREE.Vector3(),
+        velocity: new THREE.Vector3(0, 0, 0),
         yaw: 0,
         pitch: 0,
         moveYaw: 0,
@@ -5383,6 +5463,16 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
             if (mount.userData.riderAnchor) {
                 mount.userData.riderAnchor.position.y +=
                     (0.38 - mount.userData.riderAnchor.position.y) * 0.18;
+            }
+        }
+
+        // 调用新架构的腿部与全身步态/微动更新
+        if (typeof XM !== 'undefined' && XM.updateCharacterLocomotion) {
+            const time = (mount.userData.walkTime || 0) * 0.1;
+            const rider = mount.userData.riderAnchor?.children[0];
+            if (rider) {
+                XM.updateCharacterLocomotion(rider.userData?.characterHandle || rider, delta, moving, 4, time);
+                XM.updateProceduralIdle(rider.userData?.characterHandle || rider, delta, moving, time);
             }
         }
     }
@@ -7156,18 +7246,14 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
     function updatePlayer(delta) {
         const input = getMovementInput();
 
-        // 键盘左右现在是“旋转”，不是横向移动。
-        // yaw = 0 时人物面向 +Z；yaw 增大时向 +X 方向转。
+        // 键盘左右：转向
         const keyboardTurnLeft = keys["KeyA"] || keys["ArrowLeft"];
         const keyboardTurnRight = keys["KeyD"] || keys["ArrowRight"];
-        // Three.js 的 yaw 正方向与用户看到的“右转”方向相反，
-        // 因此这里明确交换正负号：← 左转、→ 右转。
         const turnDirection =
             (keyboardTurnLeft ? 1 : 0) -
             (keyboardTurnRight ? 1 : 0);
 
         if (pointerDirection && pointerDirection.strength > 0.05) {
-            // 手指/鼠标/摇杆拥有最高优先级：人物始终朝输入方向。
             player.yaw = Math.atan2(
                 pointerDirection.x,
                 pointerDirection.y
@@ -7177,44 +7263,35 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
             player.yaw += turnDirection * turnSpeed * delta;
         }
 
-        const movement = new THREE.Vector3();
-
-        // 触屏方向键保持平面移动。
-        // 键盘 W/↑、S/↓ 则严格按照人物当前 yaw 计算前后。
-        const keyboardForward =
-            keys["KeyW"] || keys["ArrowUp"];
-        const keyboardBackward =
-            keys["KeyS"] || keys["ArrowDown"];
+        const targetDir = new THREE.Vector3();
+        const keyboardForward = keys["KeyW"] || keys["ArrowUp"];
+        const keyboardBackward = keys["KeyS"] || keys["ArrowDown"];
 
         if (pointerDirection && pointerDirection.strength > 0.05) {
-            movement.set(
+            targetDir.set(
                 pointerDirection.x * pointerDirection.strength,
                 0,
                 pointerDirection.y * pointerDirection.strength
             );
         } else if (keyboardForward || keyboardBackward) {
             const direction = keyboardForward ? 1 : -1;
-            movement.set(
+            targetDir.set(
                 Math.sin(player.yaw) * direction,
                 0,
                 Math.cos(player.yaw) * direction
             );
         } else if (input.lengthSq && input.lengthSq() > 0.0001) {
-            movement.set(input.x, 0, input.y);
+            targetDir.set(input.x, 0, input.y);
         }
 
-        if (movement.lengthSq() > 1) {
-            movement.normalize();
+        if (targetDir.lengthSq() > 1) {
+            targetDir.normalize();
         }
-
-        const isMoving = movement.lengthSq() > 0.0001;
-        player.moving = isMoving;
 
         const nearest = getNearestRoad(player.position);
         player.currentRoad = nearest.road;
 
-        let speed = CONFIG.playerWalkSpeed * partyStats().speed;
-
+        let targetSpeedScalar = CONFIG.playerWalkSpeed * partyStats().speed;
         const onMainRoad =
             nearest.distance < CONFIG.roadWidth * 0.7 &&
             nearest.road &&
@@ -7226,16 +7303,23 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
             nearest.road.type === "branch";
 
         if (onMainRoad) {
-            speed *= player.roadSpeedMultiplier;
+            targetSpeedScalar *= player.roadSpeedMultiplier;
         } else if (onBranchRoad) {
-            speed *= 2.0;
+            targetSpeedScalar *= 2.0;
         } else if (sprinting) {
-            speed = CONFIG.playerSprintSpeed * partyStats().speed;
+            targetSpeedScalar = CONFIG.playerSprintSpeed * partyStats().speed;
         }
 
-        const previousPosition = player.position.clone();
+        // 惯性与加速度/阻尼动力学模型
+        const targetVel = targetDir.clone().multiplyScalar(targetSpeedScalar);
+        const accelRate = targetDir.lengthSq() > 0.0001 ? 14 : 9;
+        player.velocity.lerp(targetVel, Math.min(1, delta * accelRate));
 
-        player.position.addScaledVector(movement, speed * delta);
+        const isMoving = player.velocity.lengthSq() > 0.04;
+        player.moving = isMoving;
+
+        const previousPosition = player.position.clone();
+        player.position.addScaledVector(player.velocity, delta);
 
         player.position.x = THREE.MathUtils.clamp(
             player.position.x,
@@ -7260,9 +7344,6 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
 
         playerGroup.position.copy(player.position);
 
-        // 人物模型始终朝向当前 yaw。
-        // 白龙马模型自身的“头部”朝 +X，而游戏的正前方是 +Z，
-        // 因此模型显示角度需要减去 90°。
         const modelYaw = player.yaw - Math.PI / 2;
         playerGroup.rotation.y = lerpAngle(
             playerGroup.rotation.y,
@@ -7271,8 +7352,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         );
 
         if (isMoving) {
-            // 队伍跟随使用真实的移动方向。
-            player.moveYaw = Math.atan2(movement.x, movement.z);
+            player.moveYaw = Math.atan2(player.velocity.x, player.velocity.z);
         }
 
         animatePlayerModel(delta, isMoving);
@@ -7364,6 +7444,14 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
 
             companion.group.position.y =
                 terrainHeight(companion.group.position.x, companion.group.position.z) + bob;
+
+            // 为队友 (悟空、八戒、沙僧等) 调用腿部与全身步行/跑动动作更新
+            if (typeof XM !== 'undefined' && XM.updateCharacterLocomotion) {
+                const companionTime = (companion.group.userData.walkTime || 0) * 0.1;
+                const figure = companion.group.userData?.characterHandle || companion.group;
+                XM.updateCharacterLocomotion(figure, delta, player.moving, 4, companionTime);
+                XM.updateProceduralIdle(figure, delta, player.moving, companionTime);
+            }
         });
 
         lastCompanionFormationYaw = currentYaw;
@@ -8735,6 +8823,27 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
             220
         );
 
+        if (sun.shadow) {
+            sun.shadow.mapSize.set(4096, 4096);
+            sun.shadow.bias = -0.0005;
+            if (sun.shadow.camera) {
+                sun.shadow.camera.left = -150;
+                sun.shadow.camera.right = 150;
+                sun.shadow.camera.top = 150;
+                sun.shadow.camera.bottom = -150;
+                sun.shadow.camera.near = 10;
+                sun.shadow.camera.far = 1000;
+                if (sun.shadow.camera.updateProjectionMatrix) {
+                    sun.shadow.camera.updateProjectionMatrix();
+                }
+            }
+        }
+
+        if (renderer && (renderer.toneMapping === undefined || renderer.toneMapping === THREE.NoToneMapping)) {
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.2;
+        }
+
         const daylight =
             THREE.MathUtils.clamp(
                 Math.sin(angle) * 0.5 + 0.5,
@@ -8751,21 +8860,26 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         const sky =
             new THREE.Color();
 
-        sky.setHSL(
-            0.55,
-            0.22,
-            0.43 + daylight * 0.20
-        );
+        // 动态时间光照调色板：黎明/正午/黄昏/夜晚
+        if (daylight > 0.6) {
+            sky.setHSL(0.58, 0.35, 0.45 + daylight * 0.2);
+        } else if (daylight > 0.3) {
+            sky.setHSL(0.08, 0.65, 0.45); // 金黄/晚霞
+        } else {
+            sky.setHSL(0.65, 0.45, 0.12); // 夜空
+        }
 
         scene.background.lerp(
             sky,
-            0.01
+            0.02
         );
 
-        scene.fog.color.lerp(
-            sky,
-            0.01
-        );
+        if (scene.fog) {
+            scene.fog.color.lerp(sky, 0.02);
+            if (scene.fog.density !== undefined) {
+                scene.fog.density = 0.0008 + (1 - daylight) * 0.0012;
+            }
+        }
     }
 
     /*

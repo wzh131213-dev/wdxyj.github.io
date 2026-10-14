@@ -123,7 +123,7 @@ class Light extends Object3D { constructor(...a) { super(); this.args = a; this.
 const loose = (Cls) => class extends Cls { constructor(...a) { super(...a); return new Proxy(this, { get: (t, k, r) => (k in t ? Reflect.get(t, k, t) : (typeof k === 'string' && /^(set|get|add|sub|multiply|divide|apply|copy|clone|lerp|normalize|negate|clamp|floor|ceil|round|min|max|project|reflect|rotate|translate|compose|decompose|make|from|to|update|look|cross|dot|distance|length|angle|equals|invert|transpose|premultiply|identity|dispose)/.test(k) ? function () { return t; } : undefined)) }); } };
 const LV3 = loose(V3), LObj = loose(Object3D), LColor = loose(Color);
 const THREE = {
-  Vector3: LV3, Color: LColor, Euler, Object3D: LObj, Group: class Group extends LObj {}, Mesh, InstancedMesh, Matrix4, BufferGeometry, PlaneGeometry, CatmullRomCurve3, Float32BufferAttribute: Attr, BufferAttribute: Attr,
+  Vector3: LV3, Color: LColor, Euler, Object3D: LObj, Group: class Group extends LObj {}, Bone: class Bone extends LObj {}, Skeleton: class Skeleton { constructor(b) { this.bones = b; } }, SkinnedMesh: class SkinnedMesh extends Mesh { bind(s) { this.skeleton = s; } }, Mesh, InstancedMesh, Matrix4, BufferGeometry, PlaneGeometry, CatmullRomCurve3, Float32BufferAttribute: Attr, BufferAttribute: Attr,
   BoxGeometry: geo(), CylinderGeometry: geo(), ConeGeometry: geo(), SphereGeometry: geo(), CapsuleGeometry: geo(), TorusGeometry: geo(), IcosahedronGeometry: geo(), DodecahedronGeometry: geo(),
   MeshStandardMaterial: Material, MeshBasicMaterial: Material, MeshPhysicalMaterial: Material, MeshLambertMaterial: Material, LineBasicMaterial: Material,
   DirectionalLight: Light, HemisphereLight: Light, PointLight: Light, AmbientLight: Light,
