@@ -2579,11 +2579,16 @@ function hashMesh(m) {
   return h.toString(16).padStart(8, '0');
 }
 
+
 // ──────── xiyou-character.js ────────
 // xiyou-character.js — 重走西游 · 人物建模（程序化、纯数据；接入 THREE 见 xiyou-three.js）
 // 依据 BIBLE §7.2：米制骨架(Mixamo 风格命名)；躯干 14 环、四肢 8 环、16 边的椭圆放样；
 // 距离权重蒙皮(2~4 影响、归一化、2 次拉普拉斯平滑)；手为低模连指手套(拇指/食指/中指/无名+小指各 2 节)。
 // 静止姿态 = A 字站姿，所有骨骼静止旋转为单位四元数 → 动画层用"相对静止姿态的欧拉偏移"即可。
+// import {
+//   TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, computeNormals, xf, mirrorX, filterTris,
+//   mergeMeshes, colorize, loft, lathe, ellipsoid, torus, bounds, MeshBuilder,
+// } from './xiyou-core.js';
 
 const rad = (d) => (d * Math.PI) / 180;
 
@@ -3381,10 +3386,12 @@ function bakeCharacter(data, { colorScale = 1 } = {}) {
   return { kind: data.kind, name: data.name, height: data.height, layout: data.layout, weapon: data.weapon, capsules: data.capsules, skeleton: data.skeleton, buckets };
 }
 
+
 // ──────── xiyou-world.js ────────
 // xiyou-world.js — 重走西游 · 环境建模（纯数据、种子确定；接入 THREE 见 xiyou-three.js）
 // 依据 BIBLE §4.1 高度函数 / §4.2 可分离网格 / §4.3 着色权重 / §4.6 岩石 / §3.2 远山环带。
 // 道路 = 若干条折线控制点（Catmull-Rom），由你的"每局路网生成器"传入；本模块只负责把路压进地形、出 LUT、出权重。
+// import { TAU, clamp, lerp, smoothstep, v3, mulberry32, makeNoise, computeNormals, icosphere, bounds } from './xiyou-core.js';
 
 const SUN_DIR = v3.norm([-0.6, 0.165, -0.78]);
 const WIND_DIR = [0.62, 0.78];
@@ -3712,6 +3719,7 @@ function buildMountainRings({ seed = 5, sunDir = SUN_DIR, fogColor = [0.50, 0.42
   });
 }
 
+
 // ──────── xiyou-three.js ────────
 // xiyou-three.js — 把 xiyou-character / xiyou-world 产出的纯数据接到 THREE（建议 three ≥ r152）
 // THREE 由调用方注入，因此既可 `import * as THREE from 'three'`，也可用静态页里的全局 THREE：
@@ -3864,8 +3872,10 @@ function createWorldObjects(THREE, { terrain, protos, placement, rings }, opts =
   return out;
 }
 
-return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshBuilder, computeNormals, transformMesh, xf, mirrorX, filterTris, mergeMeshes, colorize, loft, lathe, ellipsoid, torus, icosphere, signedVolume, bounds, validateMesh, hashMesh, makeLayout, buildSkeleton, skinMesh, rigidMesh, torsoAt, legRadius, legPoint, armPath, armRadius, footMesh, headShape, mat, shell, CHARACTERS, buildCharacterData, eulerMat, RIDE_POSE, poseData, bakeCharacter, SUN_DIR, WIND_DIR, DEFAULT_ROAD, PALETTE, generateRoad, makeGround, makeAxis, sampleHeights, buildTerrain, terrainHeightFromMesh, makeRockPrototypes, composeMatrix, placeRocks, MOUNTAIN_LAYERS, buildMountainRings, toGeometry, makeMaterial, createCharacter, createStaticCharacter, createTerrainMesh, createRocks, createMountains, createWorldObjects };
+
+  return { mulberry32, hashStr, makeNoise, computeNormals, transformMesh, xf, mirrorX, filterTris, mergeMeshes, colorize, loft, lathe, ellipsoid, torus, icosphere, signedVolume, bounds, validateMesh, hashMesh, TAU, clamp, lerp, smoothstep, v3, MeshBuilder, makeLayout, buildSkeleton, skinMesh, rigidMesh, torsoAt, legPoint, armPath, footMesh, headShape, shell, buildCharacterData, eulerMat, poseData, bakeCharacter, legRadius, armRadius, mat, CHARACTERS, RIDE_POSE, generateRoad, makeGround, makeAxis, sampleHeights, buildTerrain, terrainHeightFromMesh, makeRockPrototypes, composeMatrix, placeRocks, buildMountainRings, SUN_DIR, WIND_DIR, DEFAULT_ROAD, PALETTE, MOUNTAIN_LAYERS, toGeometry, makeMaterial, createCharacter, createStaticCharacter, createTerrainMesh, createRocks, createMountains, createWorldObjects };
 })();
+
     const XM_CFG = {
         enabled: true,
         cell: 5,
