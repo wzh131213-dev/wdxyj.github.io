@@ -2,7 +2,7 @@
 // 用 mock 的 THREE / DOM 把整份游戏脚本真正执行：生成世界、跑 90 帧动画、换队伍(覆盖全部 12 个角色)、存读档，
 // 并输出世界布局指纹（道路/建筑/资源/树石的 x,z）——改完游戏文件后跑一遍，能立刻看出"有没有抛错""世界布局有没有被改动"。
 // 注意：这不是真实 WebGL 渲染，只验证"不抛错 + 逻辑一致 + 布局不变"；外观仍需在浏览器里目检。
-// 故障注入：SABOTAGE=ground|terrain|figure|rock|all node game_smoke.mjs 游戏.html   （验证新模型出错时会回退到旧实现）
+// 故障注入：SABOTAGE=ground|terrain|figure|rock|all|fx|post|cloth|idle|atmos|shader|ride|everything node game_smoke.mjs 游戏.html   （验证新模型出错时会回退到旧实现）
 import fs from 'node:fs';
 
 const [, , scriptPath, label = 'run'] = process.argv;
@@ -94,7 +94,7 @@ class Object3D {
   getWorldPosition(t) { return t.copy(this.position); }
   lookAt() {} updateMatrixWorld() {} updateWorldMatrix() {} localToWorld(v) { return v; } worldToLocal(v) { return v; } rotateY(a) { this.rotation.y += a; } getWorldDirection(t) { return t.set(0, 0, 1); }
 }
-class Attr { constructor(arr, itemSize) { this.array = arr; this.itemSize = itemSize; this.count = arr.length / itemSize; this.needsUpdate = false; }
+class Attr { setUsage(u) { this.usage = u; return this; } constructor(arr, itemSize) { this.array = arr; this.itemSize = itemSize; this.count = arr.length / itemSize; this.needsUpdate = false; }
   getX(i) { return this.array[i * this.itemSize]; } getY(i) { return this.array[i * this.itemSize + 1]; } getZ(i) { return this.array[i * this.itemSize + 2]; }
   setX(i, v) { this.array[i * this.itemSize] = v; } setY(i, v) { this.array[i * this.itemSize + 1] = v; } setZ(i, v) { this.array[i * this.itemSize + 2] = v; }
   setXYZ(i, x, y, z) { this.array[i * this.itemSize] = x; this.array[i * this.itemSize + 1] = y; this.array[i * this.itemSize + 2] = z; } }
@@ -103,11 +103,23 @@ class BufferGeometry { constructor() { this.attributes = {}; this.index = null; 
   computeBoundingBox() {} computeBoundingSphere() {} computeVertexNormals() {} dispose() { this.disposed = true; }
   rotateX(a) { const p = this.attributes.position; if (p) for (let i = 0; i < p.count; i++) { const y = p.getY(i), z = p.getZ(i); p.setY(i, y * Math.cos(a) - z * Math.sin(a)); p.setZ(i, y * Math.sin(a) + z * Math.cos(a)); } return this; }
   translate() { return this; } scale() { return this; } rotateY() { return this; } rotateZ() { return this; } toNonIndexed() { return this; } applyMatrix4() { return this; } }
+const mat4Compose = (p, r, s) => { const a = Math.cos(r.x), b = Math.sin(r.x), c = Math.cos(r.y), d = Math.sin(r.y), e = Math.cos(r.z), f = Math.sin(r.z), ae = a * e, af = a * f, be = b * e, bf = b * f;
+  return [(c * e) * s.x, (af + be * d) * s.x, (bf - ae * d) * s.x, 0, (-c * f) * s.y, (ae - bf * d) * s.y, (be + af * d) * s.y, 0, d * s.z, (-b * c) * s.z, (a * c) * s.z, 0, p.x, p.y, p.z, 1]; };
+const mat4Mul = (A, B) => { const o = new Array(16).fill(0); for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) for (let k = 0; k < 4; k++) o[4 * j + i] += A[4 * k + i] * B[4 * j + k]; return o; };
+Object.defineProperty(Object3D.prototype, 'matrixWorld', { get() { return (this._mw ??= { elements: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }); } });
+Object3D.prototype.updateWorldMatrix = function (up) { if (up && this.parent && this.parent.updateWorldMatrix) this.parent.updateWorldMatrix(true, false); const L = mat4Compose(this.position, this.rotation, this.scale); this.matrixWorld.elements = this.parent && this.parent.matrixWorld ? mat4Mul(this.parent.matrixWorld.elements, L) : L; };
+class V2 { constructor(x = 0, y = 0) { this.x = x; this.y = y; } set(x, y) { this.x = x; this.y = y; return this; } }
+class V4 { constructor(x = 0, y = 0, z = 0, w = 0) { this.x = x; this.y = y; this.z = z; this.w = w; } set(x, y, z, w) { this.x = x; this.y = y; this.z = z; this.w = w; return this; } }
+class DataTexture { constructor(d, w, h, f) { this.image = { data: d, width: w, height: h }; this.format = f; this.repeat = new V2(); } }
+class WebGLRenderTarget { constructor(w, h, o) { this.w = w; this.h = h; this.o = o; this.texture = {}; } dispose() { this.disposed = true; } }
+class PMREMGenerator { fromScene() { globalThis.__pmrem = (globalThis.__pmrem || 0) + 1; return new WebGLRenderTarget(1, 1, {}); } dispose() {} }
+class Bone extends Object3D {} class Skeleton { constructor(bones) { this.bones = bones; } }
 const geo = () => class extends BufferGeometry { constructor(...args) { super(); this.args = args; this.attributes.position = new Attr(new Float32Array(3 * 8), 3); } };
 class PlaneGeometry extends BufferGeometry {
   constructor(w, h, ws = 1, hs = 1) { super(); const n = (ws + 1) * (hs + 1), a = new Float32Array(n * 3); let k = 0; for (let j = 0; j <= hs; j++) for (let i = 0; i <= ws; i++) { a[k++] = (i / ws - 0.5) * w; a[k++] = (0.5 - j / hs) * h; a[k++] = 0; } this.attributes.position = new Attr(a, 3); this.args = [w, h, ws, hs]; } }
-class Material { constructor(p = {}) { Object.assign(this, p); this.color = p.color instanceof Color ? p.color : new Color(p.color ?? 0xffffff); this.disposed = false; } dispose() { this.disposed = true; } }
+class Material { constructor(p = {}) { Object.assign(this, p); this.color = p.color instanceof Color ? p.color : new Color(p.color ?? 0xffffff); this.disposed = false; this.sheenColor = new Color(); this.normalScale = { x: 1, y: 1, set(x, y) { this.x = x; this.y = y; } }; this.anisotropy = 0; this.clearcoat = 0; this.version = 0; } onBeforeCompile() {} clone() { const m = new Material({}); Object.assign(m, this); return m; } dispose() { this.disposed = true; } }
 class Mesh extends Object3D { constructor(g, m) { super(); this.geometry = g; this.material = m; this.isMesh = true; } }
+class SkinnedMesh extends Mesh { bind(sk) { this.skeleton = sk; } }
 class InstancedMesh extends Mesh { constructor(g, m, n) { super(g, m); this.count = n; this.instanceMatrix = { needsUpdate: false }; this.instanceColor = null; } setMatrixAt() {} setColorAt() {} getMatrixAt() {} }
 class Matrix4 { constructor() { this.elements = new Array(16).fill(0); } fromArray(a) { a.forEach((v, i) => { this.elements[i] = v; }); return this; } compose() { return this; } makeTranslation() { return this; } makeScale() { return this; } identity() { return this; } setPosition() { return this; } multiply() { return this; } }
 class CatmullRomCurve3 {
@@ -119,7 +131,7 @@ class CatmullRomCurve3 {
   getSpacedPoints(n) { return Array.from({ length: n + 1 }, (_, i) => this.getPointAt(i / n, new V3())); }
   getTangentAt(u, t = new V3()) { const a = this.getPointAt(Math.max(0, u - 0.01)), b = this.getPointAt(Math.min(1, u + 0.01)); return t.copy(b).sub(a).normalize(); }
 }
-class Light extends Object3D { constructor(...a) { super(); this.args = a; this.intensity = 1; this.color = new Color(); this.groundColor = new Color(); this.target = new Object3D(); this.shadow = { camera: new Object3D(), mapSize: new V3(), bias: 0 }; Object.assign(this.shadow.camera, { left: 0, right: 0, top: 0, bottom: 0, near: 0, far: 0 }); } }
+class Light extends Object3D { constructor(...a) { super(); this.args = a; this.intensity = 1; this.color = new Color(); this.groundColor = new Color(); this.target = new Object3D(); this.shadow = { camera: new Object3D(), mapSize: new V3(), bias: 0 }; Object.assign(this.shadow.camera, { left: 0, right: 0, top: 0, bottom: 0, near: 0, far: 0, updateProjectionMatrix() {} }); } }
 const loose = (Cls) => class extends Cls { constructor(...a) { super(...a); return new Proxy(this, { get: (t, k, r) => (k in t ? Reflect.get(t, k, t) : (typeof k === 'string' && /^(set|get|add|sub|multiply|divide|apply|copy|clone|lerp|normalize|negate|clamp|floor|ceil|round|min|max|project|reflect|rotate|translate|compose|decompose|make|from|to|update|look|cross|dot|distance|length|angle|equals|invert|transpose|premultiply|identity|dispose)/.test(k) ? function () { return t; } : undefined)) }); } };
 const LV3 = loose(V3), LObj = loose(Object3D), LColor = loose(Color);
 const THREE = {
@@ -130,22 +142,30 @@ const THREE = {
   Scene: class Scene extends Object3D { constructor() { super(); this.background = new Color(); this.fog = null; } },
   FogExp2: class { constructor(c, d) { this.color = new Color(c); this.density = d; } },
   PerspectiveCamera: class extends Object3D { constructor() { super(); this.aspect = 1; this.fov = 60; this.near = 0.1; this.far = 5000; } updateProjectionMatrix() {} },
-  WebGLRenderer: class { constructor() { this.domElement = U('canvas'); this.shadowMap = { enabled: false, type: 0 }; this.frames = 0; } setSize() {} setPixelRatio() {} setClearColor() {} render() { this.frames++; } },
+  WebGLRenderer: class { constructor() { this.domElement = U('canvas'); this.shadowMap = { enabled: false, type: 0 }; this.frames = 0; this.toneMapping = 0; this.toneMappingExposure = 1; this.debug = {}; this.capabilities = { isWebGL2: true }; this.pr = 1; } setSize() {} setPixelRatio(v) { this.pr = v; } getPixelRatio() { return this.pr; } getSize(v) { v.x = 1280; v.y = 720; return v; } setClearColor() {} render() { this.frames++; } },
   Clock: class { getDelta() { return 1 / 60; } getElapsedTime() { return 1; } },
   MathUtils: { clamp: (v, a, b) => Math.min(b, Math.max(a, v)), lerp: (a, b, t) => a + (b - a) * t, degToRad: (d) => d * Math.PI / 180, radToDeg: (r) => r * 180 / Math.PI, damp: (a, b, l, dt) => a + (b - a) * (1 - Math.exp(-l * dt)), euclideanModulo: (n, m) => ((n % m) + m) % m },
-  PCFSoftShadowMap: 2, PCFShadowMap: 1, DoubleSide: 2, FrontSide: 0, BackSide: 1, SRGBColorSpace: 'srgb', ACESFilmicToneMapping: 4,
+  PCFSoftShadowMap: 2, PCFShadowMap: 1, DoubleSide: 2, FrontSide: 0, BackSide: 1, SRGBColorSpace: 'srgb', ACESFilmicToneMapping: 4, NoToneMapping: 0,
+  RepeatWrapping: 1000, LinearFilter: 1006, LinearMipmapLinearFilter: 1008, RGBAFormat: 1023, NoColorSpace: '', HalfFloatType: 1016, DynamicDrawUsage: 35048,
+  Material, ShaderMaterial: Material, Vector2: V2, Vector4: V4, DataTexture, PMREMGenerator, WebGLRenderTarget, Skeleton, Bone, SkinnedMesh,
+  ShaderChunk: { fog_pars_vertex: 'A', fog_vertex: 'B', fog_pars_fragment: 'C', fog_fragment: 'D' },
 };
 
 // ── 读取并改造脚本：去掉 import，末尾追加探针（同一作用域内，能访问 let/const）
 let code = fs.readFileSync(scriptPath, 'utf8');
 if (scriptPath.endsWith('.html')) { const a = code.indexOf('<script type="module">'); if (a < 0) throw new Error('没找到 <script type="module">'); code = code.slice(a + '<script type="module">'.length, code.lastIndexOf('</script>')); }
 code = code.replace(/^\s*import \* as THREE from [^\n]+\n/m, '\n');
+globalThis.__postFrames = 0;
+const passMock = (n) => class { constructor(...a) { this.n = n; this.a = a; this.passes = []; if (n === 'bloom') { this.strength = a[1]; this.radius = a[2]; this.threshold = a[3]; } } addPass(p) { this.passes.push(p); } setSize() {} setPixelRatio() {} render() { if (this.n === 'composer') globalThis.__postFrames++; } dispose() { this.disposed = true; } };
+globalThis.__postMock = (url) => { if (process.env.SABOTAGE === 'post' || process.env.SABOTAGE === 'everything') throw new Error('故障注入:post 模块加载失败'); const name = url.split('/').pop().replace('.js', ''); return { EffectComposer: passMock('composer'), RenderPass: passMock('render'), UnrealBloomPass: passMock('bloom'), SSAOPass: passMock('ssao'), OutputPass: passMock('output') }; };
+code = code.replace('const xmImport = (url) => import(url);', 'const xmImport = (url) => Promise.resolve().then(() => globalThis.__postMock(url));');
 // 故障注入：SABOTAGE=ground|terrain|figure|rock|all —— 让新模块的对应入口抛错，验证回退路径
 const SAB = process.env.SABOTAGE;
 if (SAB) {
   const boom = (name) => `XM.${name} = () => { throw new Error('故障注入:${name}'); };`;
-  const map = { ground: ['makeGround'], terrain: ['buildTerrain'], figure: ['createStaticCharacter'], rock: ['makeRockPrototypes'], all: ['makeGround', 'buildTerrain', 'createStaticCharacter', 'makeRockPrototypes'] };
-  code = code.replace('    const XM_CFG = {', map[SAB].map(boom).join('\n') + '\n    const XM_CFG = {');
+  const map = { ground: ['makeGround'], terrain: ['buildTerrain'], figure: ['createSkinnedBaked'], rock: ['makeRockPrototypes'], fx: ['installHeightFog'], cloth: ['ClothRig'], idle: ['IdleAnimator'], atmos: ['atmosphereAt'], ride: ['GaitModel'], post: [], shader: [],
+    all: ['makeGround', 'buildTerrain', 'createSkinnedBaked', 'makeRockPrototypes'], everything: ['makeGround', 'buildTerrain', 'createSkinnedBaked', 'makeRockPrototypes', 'installHeightFog', 'ClothRig', 'IdleAnimator', 'atmosphereAt', 'GaitModel'] };
+  code = code.replace('    const XM_CFG = {', map[SAB].map(boom).join('\n') + (SAB === 'shader' ? '\n    globalThis.__shaderFail = () => renderer.debug.onShaderError && renderer.debug.onShaderError();' : '') + '\n    const XM_CFG = {');
 }
 if (process.env.TRACE) {
   for (const n of ['startNewRun', 'generateRoadNetwork', 'createRoads', 'createRoadMeshes', 'generateBuildings', 'populateWorld', 'createTerrain', 'buildOpeningScene', 'rebuildCompanions', 'setPlayerRider', 'createOtherParty', 'spawnResources', 'generateResources', 'animate', 'clearGroup', 'connectNodes', 'makeNode', 'createTree', 'createRock', 'createTemple', 'createBuilding'])
@@ -156,7 +176,7 @@ code += `
 ;function __setParty(a) { party = a; }
 return { roads, roadNodes, buildings, resources, otherParties, companions, worldGroup, propGroup, npcGroup, roadGroup, buildingGroup, playerGroup, player, characters,
   getParty: () => party, setParty: __setParty, terrainHeight, terrainSurfaceHeight, startNewRun, animate, gatherSave, applySave, rebuildCompanions, setPlayerRider, createCharacterFigure,
-  CONFIG, getSeed: () => rngSeed, XM_STATE: typeof XM_STATE !== 'undefined' ? XM_STATE : null, XM: typeof XM !== 'undefined' ? XM : null };`;
+  CONFIG, getSeed: () => rngSeed, XM_STATE: typeof XM_STATE !== 'undefined' ? XM_STATE : null, XM_RT: typeof XM_RT !== 'undefined' ? XM_RT : null, XM_FX: typeof XM_FX !== 'undefined' ? XM_FX : null, cycleQuality: typeof xmCycleQuality !== 'undefined' ? xmCycleQuality : null, animatePlayerModel, xmUpdateFigures, xmRender, renderer, scene, sun, ambientLight, camera, XM: typeof XM !== 'undefined' ? XM : null };`;
 
 const logs = { error: [], warn: [] };
 const fakeConsole = { log() {}, info() {}, debug() {}, warn: (...a) => logs.warn.push(a.map(String).join(' ')), error: (...a) => logs.error.push(a.map((x) => (x && x.stack) || String(x)).join(' ')) };
@@ -167,6 +187,7 @@ try {
     THREE, document, window, localStorage, requestAnimationFrame, navigator, fakeConsole, window.addEventListener, window.removeEventListener, 1280, 720, 1, () => {}, () => {}, () => true, () => '');
 } catch (e) { console.log(`[${label}] ✗ 初始化抛错：`, e.stack.split('\n').slice(0, 6).join('\n')); process.exit(1); }
 const tInit = performance.now() - t0;
+await new Promise((r) => setTimeout(r, 30));   // 让动态 import() 的后期模块（mock）装配完成
 
 const count = (g) => { let meshes = 0, tris = 0; g.traverse((o) => { if (o.isMesh) { meshes++; const gm = o.geometry; tris += gm.index ? gm.index.count / 3 : 0; } }); return { meshes, tris }; };
 const R = (v) => Math.round(v * 100) / 100;
@@ -208,6 +229,39 @@ if (H.XM_STATE) {
     const f = H.createCharacterFigure(all.find((c) => c.id === id), 0.9, { ride: true }); const c = count(f);
     out.new['fig_' + id] = `${c.meshes}mesh/${Math.round(c.tris)}tri rideY=${f.userData.rideY === undefined ? '-' : R(f.userData.rideY)}`;
   }
+}
+// 光影 / 动态专项检查
+if (H.XM_RT) {
+  const RT = H.XM_RT, FXs = H.XM_FX, r3 = (v) => Math.round(v * 1000) / 1000, fx = {};
+  const snap = () => ({ tier: RT.tier, failed: RT.failed, atmos: RT.atmosphereOn, post: !!RT.post, ssao: !!(RT.post && RT.post.ssao), shadow: H.sun.shadow.mapSize.x, tone: H.renderer.toneMapping, exposure: r3(H.renderer.toneMappingExposure), skyIn: !!(RT.sky && H.scene.children.includes(RT.sky.mesh)), fogD: r3(H.scene.fog.density * 1e5) / 1e3 });
+  for (let f = 0; f < 5; f++) H.animate();
+  fx.start = snap(); fx.composerFrames = globalThis.__postFrames; fx.rendererFrames = H.renderer.frames; fx.pmrem = globalThis.__pmrem || 0;
+  const st = RT.state; if (st) fx.sky = { sunI: r3(H.sun.intensity), hemiI: r3(H.ambientLight.intensity), elev: r3(st.sunElev), shadowTarget: [r3(H.sun.target.position.x), r3(H.sun.target.position.z)] };
+  // 模拟玩家以 9 单位/秒前进 4 秒：马的步态、骑手跟随、同伴待机/布料
+  { const team = [all[1], all[0], all[2], all[3]]; H.setParty(team); H.setPlayerRider(team[0]); H.rebuildCompanions(); for (let f = 0; f < 5; f++) H.animate(); }   // 骑手换成新模型角色(孙悟空)
+  fx.riderIsNew = !!RT.rider;
+  { const legacyTeam = [all[4], all[0], all[1], all[2]]; H.setParty(legacyTeam); H.setPlayerRider(legacyTeam[0]); fx.riderRefAfterLegacy = RT.rider === null; const team = [all[1], all[0], all[2], all[3]]; H.setParty(team); H.setPlayerRider(team[0]); H.rebuildCompanions(); for (let f = 0; f < 5; f++) H.animate(); }
+  const pg = H.playerGroup, mount = pg.userData.mount, legs = mount.userData.legs, rider = RT.rider; H.player.moving = true;
+  let updMs = 0, kneeMin = 0, hipMax = 0, bobMax = 0, offY = 0, offX = 0, finite = true, headC = 0; const rideY = rider ? rider.userData.rideY : 0;
+  for (let i = 0; i < 240; i++) {
+    pg.position.x += 9 / 60; H.animatePlayerModel(1 / 60, true); const t1 = performance.now(); H.xmUpdateFigures(1 / 60); updMs += performance.now() - t1; if (i % 8 === 0) H.xmRender();
+    if (legs[0].userData.knee) { for (const l of legs) { kneeMin = Math.min(kneeMin, l.userData.knee.rotation.z); hipMax = Math.max(hipMax, Math.abs(l.rotation.z)); finite = finite && Number.isFinite(l.rotation.z) && Number.isFinite(l.userData.knee.rotation.z); } }
+    bobMax = Math.max(bobMax, Math.abs(mount.position.y)); if (rider) { offY = Math.max(offY, Math.abs(rider.position.y - rideY)); offX = Math.max(offX, Math.abs(rider.position.x)); headC = Math.max(headC, Math.abs(rider.userData.xm?.headCounter ?? 0)); finite = finite && Number.isFinite(rider.position.y) && Number.isFinite(rider.rotation.z); }
+  }
+  fx.updateMsPerFrame = r3(updMs / 240);
+  fx.horse = { twoSegmentLegs: !!legs[0].userData.knee, kneeMin: r3(kneeMin), hipMax: r3(hipMax), bobMax: r3(bobMax), finite };
+  if (rider) fx.rider = { skinned: !!rider.userData.xm, rideY: r3(rideY), offY: r3(offY), offX: r3(offX), headCounterMax: r3(headC) };
+  // 布料/发丝/呼吸：统计动态部件相对静止形状的最大位移、骨骼是否有待机偏移
+  const dynStat = (g) => { const xm = g.userData.xm; if (!xm) return 'legacy'; let mx = 0, bad = 0; for (const d of xm.fig.dynamic) { const a = d.mesh.geometry.attributes.position.array, rest = d.part.mesh.positions; for (let i = 0; i < a.length; i++) { if (!Number.isFinite(a[i])) bad++; else mx = Math.max(mx, Math.abs(a[i] - rest[i])); } } const head = xm.fig.boneByName('head'); return `${xm.fig.dynamic.length}动态件 最大位移${r3(mx)} 非法${bad} 头偏${r3(Math.abs(head.rotation.y) + Math.abs(head.rotation.x))}`; };
+  fx.figures = { rider: rider ? dynStat(rider) : '-' }; H.companions.forEach((c, i) => { fx.figures['companion' + i + ':' + c.group.userData.characterId] = dynStat(c.group); });
+  fx.moved = snap();
+  // 画质循环：高→中→低→自动→高，每档跑几帧；低档应关闭大气/后期，回到高档应重新开启
+  const cyc = [];
+  for (let k = 0; k < 5; k++) { const label = H.cycleQuality(); for (let f = 0; f < 6; f++) H.animate(); const s = snap(); cyc.push(`${label}→${s.tier}${s.atmos ? '+大气' : ''}${s.post ? '+后期' : ''}${s.ssao ? '+AO' : ''} 阴影${s.shadow} 色调${s.tone}`); }
+  fx.qualityCycle = cyc;
+  // 手动触发"着色器编译失败"回调：应回退到内置画面并继续渲染
+  if (typeof globalThis.__shaderFail === 'function' || H.renderer.debug.onShaderError) { H.cycleQuality; H.renderer.debug.onShaderError && H.renderer.debug.onShaderError(); for (let f = 0; f < 6; f++) H.animate(); fx.afterShaderError = snap(); }
+  out.fx = fx;
 }
 out.consoleErrors = logs.error.slice(0, 5); out.consoleWarns = logs.warn.length;
 process.stdout.write(JSON.stringify(out, null, 1) + '\n', () => process.exit(0));   // 游戏里有 setInterval，不主动退出会一直挂着

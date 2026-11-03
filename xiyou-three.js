@@ -1,3 +1,5 @@
+import { invertAffine, Cloth, CLOTH_PRESETS } from './xiyou-motion.js';
+
 // xiyou-three.js — 把 xiyou-character / xiyou-world 产出的纯数据接到 THREE（建议 three ≥ r152）
 // THREE 由调用方注入，因此既可 `import * as THREE from 'three'`，也可用静态页里的全局 THREE：
 //   import { buildCharacterData } from './xiyou-character.js';
@@ -20,14 +22,26 @@ export function toGeometry(THREE, m, { skinned = false } = {}) {
   return g;
 }
 
-/** 材质描述 → THREE 材质。opts.materialFactory(spec) 可返回自定义材质（例如你项目里的 patchMaterial）；返回空则走默认 */
+/**
+ * 材质描述(PBR 规格) → THREE 材质。opts.materialFactory(spec) 可整体接管；opts.normalMaps(spec.normalMap) 提供微法线贴图；
+ * opts.env 提供 register(material) 以接入 PMREM 环境反射。
+ * 分层：metal=MeshStandard(金属度0.92/粗糙0.22 + 环境反射)；cloth=MeshPhysical(sheen 微纤维光泽，暖金 sheenColor)；
+ *      skin/fur/hair=微法线扰动（hair/fur 带各向异性高光）；gloss(眼睛)=MeshPhysical(clearcoat)。
+ */
 export function makeMaterial(THREE, spec, opts = {}) {
   if (opts.materialFactory) { const custom = opts.materialFactory(spec); if (custom) return custom; }
-  const physical = spec.kind === 'cloth' && spec.sheen > 0 && THREE.MeshPhysicalMaterial;
-  const Cls = physical || THREE.MeshStandardMaterial;
+  const physical = !!THREE.MeshPhysicalMaterial && (spec.sheen > 0 || spec.anisotropy > 0 || spec.clearcoat > 0);
+  const Cls = physical ? THREE.MeshPhysicalMaterial : THREE.MeshStandardMaterial;
   const mat = new Cls({ roughness: spec.roughness ?? 0.8, metalness: spec.metalness ?? 0, side: spec.side === 'double' ? THREE.DoubleSide : THREE.FrontSide, vertexColors: !!spec.vertexColors });
   mat.color.setRGB(spec.color[0], spec.color[1], spec.color[2]);
-  if (physical) { mat.sheen = spec.sheen; mat.sheenColor.setRGB(...spec.sheenColor); mat.sheenRoughness = 0.5; }
+  if (spec.envMapIntensity !== undefined) mat.envMapIntensity = spec.envMapIntensity;
+  if (physical) {
+    if (spec.sheen > 0) { mat.sheen = spec.sheen; mat.sheenColor.setRGB(...(spec.sheenColor ?? [1, 1, 1])); mat.sheenRoughness = spec.sheenRoughness ?? 0.5; }
+    if (spec.anisotropy > 0 && 'anisotropy' in mat) { mat.anisotropy = spec.anisotropy; mat.anisotropyRotation = spec.anisotropyRotation ?? 0; }
+    if (spec.clearcoat > 0) { mat.clearcoat = spec.clearcoat; mat.clearcoatRoughness = spec.clearcoatRoughness ?? 0.05; }
+  }
+  if (spec.normalMap && opts.normalMaps) { const tex = opts.normalMaps(spec.normalMap); if (tex) { mat.normalMap = tex; mat.normalScale.set(spec.normalMap.scale ?? 1, spec.normalMap.scale ?? 1); } }
+  if (opts.env && opts.env.register && (spec.envMapIntensity ?? 0) > 0) opts.env.register(mat);
   mat.name = spec.kind;
   return mat;
 }
@@ -90,6 +104,10 @@ export function createStaticCharacter(THREE, baked, opts = {}) {
     group.add(mesh);
     return mesh;
   });
+  for (const d of baked.dynamic ?? []) {                      // 动态部件在静态模式下按静止形状显示
+    const mesh = new THREE.Mesh(toGeometry(THREE, d.mesh), makeMaterial(THREE, { ...d.material, color: [1, 1, 1], vertexColors: true }, opts));
+    mesh.name = d.name; mesh.castShadow = opts.castShadow ?? true; group.add(mesh); meshes.push(mesh);
+  }
   function dispose() { for (const m of meshes) { m.geometry.dispose(); m.material.dispose?.(); } }
   return { group, meshes, dispose, baked };
 }
@@ -100,6 +118,7 @@ export function createTerrainMesh(THREE, terrain, opts = {}) {
   g.setAttribute('position', new THREE.BufferAttribute(terrain.positions, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(terrain.normals, 3));
   if (terrain.colors) g.setAttribute('color', new THREE.BufferAttribute(terrain.colors, 3));
+  if (terrain.splat) g.setAttribute('splat', new THREE.BufferAttribute(terrain.splat, 4));
   g.setIndex(new THREE.BufferAttribute(terrain.indices, 1));
   const mat = opts.material ?? new THREE.MeshStandardMaterial({ vertexColors: !!terrain.colors, roughness: 0.92, metalness: 0 });
   const mesh = new THREE.Mesh(g, mat);
@@ -147,4 +166,71 @@ export function createWorldObjects(THREE, { terrain, protos, placement, rings },
   if (protos && placement) { out.rocks = createRocks(THREE, protos, placement, opts.rocks); group.add(out.rocks.group); }
   if (rings) group.add((out.mountains = createMountains(THREE, rings, opts.mountains)));
   return out;
+}
+
+/**
+ * 蒙皮烘焙角色（bakeCharacter 的结果）：骨骼层级 + 每个 PBR 桶一个 SkinnedMesh(共用 Skeleton) + 动态部件(披风/飘带/袈裟/长发)各一个普通 Mesh（由 ClothRig 每帧改写顶点）。
+ * 返回 { group, bones, skeleton, boneByName, meshes, dynamic:[{mesh, part}], colliders, dispose }。
+ */
+export function createSkinnedBaked(THREE, baked, opts = {}) {
+  const sk = baked.skeleton, group = new THREE.Group();
+  group.name = `character:${baked.kind}`;
+  const bones = sk.bones.map((b) => { const bone = new THREE.Bone(); bone.name = b.name; return bone; });
+  sk.bones.forEach((b, i) => {
+    const pp = b.parent >= 0 ? sk.bones[b.parent].pos : [0, 0, 0], r = [b.pos[0] - pp[0], b.pos[1] - pp[1], b.pos[2] - pp[2]];
+    bones[i].position.set(r[0], r[1], r[2]); bones[i].userData.rest = r;
+    if (b.parent >= 0) bones[b.parent].add(bones[i]);
+  });
+  group.add(bones[0]); group.updateMatrixWorld(true);
+  const skeleton = new THREE.Skeleton(bones), meshes = [], boneByName = (n) => bones[sk.index[n]];
+  for (const b of baked.buckets) {
+    const mesh = new THREE.SkinnedMesh(toGeometry(THREE, b.mesh, { skinned: true }), makeMaterial(THREE, { ...b.material, vertexColors: true }, opts));
+    mesh.name = b.name; mesh.frustumCulled = false; mesh.castShadow = opts.castShadow ?? true; mesh.receiveShadow = !!opts.receiveShadow;
+    group.add(mesh); mesh.bind(skeleton); meshes.push(mesh);
+  }
+  const dynamic = (baked.dynamic ?? []).map((d) => {
+    const geo = toGeometry(THREE, { ...d.mesh, positions: Float32Array.from(d.mesh.positions), normals: Float32Array.from(d.mesh.normals) });   // 拷贝：仿真会改写，不能污染缓存里的烘焙数据
+    if (THREE.DynamicDrawUsage !== undefined) { geo.attributes.position.setUsage?.(THREE.DynamicDrawUsage); geo.attributes.normal.setUsage?.(THREE.DynamicDrawUsage); }
+    const mesh = new THREE.Mesh(geo, makeMaterial(THREE, { ...d.material, color: [1, 1, 1], vertexColors: true }, opts));
+    mesh.name = d.name; mesh.frustumCulled = false; mesh.castShadow = opts.castShadow ?? true; group.add(mesh);
+    return { mesh, part: d };
+  });
+  function dispose() { for (const m of [...meshes, ...dynamic.map((d) => d.mesh)]) { m.geometry.dispose(); m.material.dispose?.(); } }
+  return { group, root: bones[0], bones, skeleton, boneByName, meshes, dynamic, colliders: baked.colliders, dispose, baked };
+}
+
+/** 把 IdleAnimator 的 pose 写到骨骼上（相对静止姿态的欧拉偏移；眨眼=眼骨沿 Y 压扁；视线=眼骨微位移；k=模型尺度） */
+export function applyIdlePose(fig, pose, k = 1) {
+  const B = fig.boneByName;
+  for (const n of ['spine1', 'spine2', 'chest', 'head']) { const b = B(n); if (b) b.rotation.set(pose[n][0], pose[n][1], pose[n][2]); }
+  B('clavicle_L')?.rotation.set(0, 0, pose.clavL[2]); B('clavicle_R')?.rotation.set(0, 0, pose.clavR[2]);
+  B('chest')?.scale.set(1, 1 + pose.chestScale, 1 + pose.chestScale);
+  for (const n of ['eye_L', 'eye_R']) { const e = B(n); if (!e) continue; e.scale.y = Math.max(0.06, 1 - 0.94 * pose.blink); const r = e.userData.rest; e.position.set(r[0] + pose.eyeX * 0.0009 * k, r[1] + pose.eyeY * 0.0007 * k, r[2]); }
+}
+
+/**
+ * 布料装配：每个动态部件一个 Cloth（Verlet/PBD）。update(dt, wind) 在世界空间仿真并把结果写回网格局部空间。
+ * wind 为世界风向量；extraColliders（模型局部空间胶囊）可追加坐骑等碰撞体；离屏/过远可传 skip 跳过。
+ */
+export class ClothRig {
+  constructor() { this.items = []; this.inv = new Float64Array(16); }
+  add(entry, { colliders = [], extraColliders = [], presets = CLOTH_PRESETS } = {}) {
+    const part = entry.part, kind = part.type === 'tails' ? 'tails' : part.type === 'hair' ? 'hair' : part.type === 'drape' ? 'drape' : 'cape';
+    const cloth = new Cloth(part.mesh.positions, part.mesh.indices, { pin: part.pin, ...presets[kind] });
+    this.items.push({ mesh: entry.mesh, cloth, colliders: [...colliders, ...extraColliders], type: part.type });
+    return cloth;
+  }
+  update(dt, wind, skip = false) {
+    if (skip) return;
+    for (const it of this.items) {
+      it.mesh.updateWorldMatrix(true, false);
+      const M = it.mesh.matrixWorld.elements;
+      if (it.cloth.step(dt, M, wind, it.colliders)) {
+        const a = it.mesh.geometry.attributes;
+        it.cloth.writeLocal(invertAffine(M, this.inv), a.position.array, a.normal.array);
+        a.position.needsUpdate = true; a.normal.needsUpdate = true;
+      }
+    }
+  }
+  reset() { for (const it of this.items) it.cloth.reset(); }
 }

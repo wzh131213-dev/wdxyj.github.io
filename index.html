@@ -2151,23 +2151,33 @@
     </div>
 </div>
 
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+
 <script type="module">
     import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+
     /*
         ============================================================
-        新建模层（重走西游 · 环境与人物建模）
+        新建模层（重走西游 · 环境/人物建模 + 动态物理 + PBR + 光影 + 后期）
         ------------------------------------------------------------
-        XM = xiyou-core / xiyou-character / xiyou-world / xiyou-three 四个模块打成的一个包（依据 BIBLE 规范）。
+        XM = xiyou-core / world / character / motion / fx / three 六个模块打成的一个包（依据 BIBLE 规范）。
         接入原则：
-        1. 旧实现全部保留，改名为 *Legacy；新模型任何一步出错都会回退到旧实现，游戏不会因此打不开。
+        1. 旧实现全部保留，改名为 *Legacy；新模型/新特效任何一步出错都会回退到旧实现，游戏不会因此打不开。
         2. 随机数消耗次数与顺序保持不变，所以同一世界种子 / 旧存档生成的世界布局（道路、建筑、树石位置）不变。
         3. terrainHeight / terrainSurfaceHeight 与渲染网格严格同一张高度栅格，玩法高度与看到的地面一致。
-        整体关闭：把 XM_CFG.enabled 改成 false，即回到旧地形与旧人物。
+        4. 画质分 高/中/低 三档：点击右上"⚙ 设置"循环（高→中→低→自动），或网址加 ?quality=high|medium|low；自动档按帧时间升降。
+        整体关闭：XM_CFG.enabled=false（旧地形/旧人物）；XM_FX.enabled=false（旧光影/旧动画/无后期）。
         ============================================================
     */
     const XM = (function () {
-'use strict';
-// ──────── xiyou-core.js ────────
+// ───── xiyou-core.js ─────
 // xiyou-core.js — 重走西游 · 建模核心（零依赖、纯数据，可在 Node / 浏览器 / Worker 中运行）
 // 约定（与 BIBLE §0.1 一致）：单位米；+Y 向上；角色朝向 +Z；角色的"左侧" = +X。
 // 所有网格都是 { positions, normals, uvs, indices[, colors, skinIndex, skinWeight] } 的 TypedArray 对象。
@@ -2579,12 +2589,347 @@ function hashMesh(m) {
   return h.toString(16).padStart(8, '0');
 }
 
-// ──────── xiyou-character.js ────────
+// ───── xiyou-world.js ─────
+// xiyou-world.js — 重走西游 · 环境建模（纯数据、种子确定；接入 THREE 见 xiyou-three.js）
+// 依据 BIBLE §4.1 高度函数 / §4.2 可分离网格 / §4.3 着色权重 / §4.6 岩石 / §3.2 远山环带。
+// 道路 = 若干条折线控制点（Catmull-Rom），由你的"每局路网生成器"传入；本模块只负责把路压进地形、出 LUT、出权重。
+const SUN_DIR = v3.norm([-0.6, 0.165, -0.78]);
+const WIND_DIR = [0.62, 0.78];
+const DEFAULT_ROAD = [[-420, 130], [-220, 75], [-70, 38], [0, 30], [80, 12], [190, -55], [420, -150]];
+/** 线性反照率（BIBLE §4.4 的目标范围） */
+const PALETTE = { lush: [0.08, 0.11, 0.035], dry: [0.20, 0.145, 0.055], dirt: [0.16, 0.12, 0.08], rock: [0.18, 0.17, 0.155] };
+
+/** 由种子生成一条蜿蜒的路（控制点）；每局换种子即换路 */
+function generateRoad(seed, o = {}) {
+  const rnd = mulberry32(seed), step = o.step ?? 110, n = o.points ?? 9, lim = o.limit ?? 520;
+  let [x, z] = o.start ?? [-420, 130], head = o.heading ?? -0.25;
+  const pts = [[x, z]];
+  for (let i = 1; i < n; i++) {
+    head += (rnd() - 0.5) * (o.turn ?? 0.7);
+    if (Math.hypot(x, z) > lim) head += 0.5 * Math.sin(Math.atan2(-z, -x) - head);   // 出界则轻轻拐回中心
+    x += Math.cos(head) * step; z += Math.sin(head) * step; pts.push([x, z]);
+  }
+  return pts;
+}
+
+function splineSamples(pts, step = 0.5) {
+  const P = [pts[0], ...pts, pts[pts.length - 1]], dense = [];
+  for (let i = 1; i < P.length - 2; i++) {
+    const [p0, p1, p2, p3] = [P[i - 1], P[i], P[i + 1], P[i + 2]], m = Math.max(8, Math.ceil(Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / 0.1));
+    for (let j = 0; j < m; j++) {
+      const t = j / m, t2 = t * t, t3 = t2 * t;
+      dense.push([0, 1].map((k) => 0.5 * (2 * p1[k] + (-p0[k] + p2[k]) * t + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2 + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3)));
+    }
+  }
+  dense.push(P[P.length - 2]);
+  const out = [dense[0]]; let acc = 0, next = step;
+  for (let i = 1; i < dense.length; i++) {
+    const d = Math.hypot(dense[i][0] - dense[i - 1][0], dense[i][1] - dense[i - 1][1]);
+    while (acc + d >= next) { const t = (next - acc) / d; out.push([lerp(dense[i - 1][0], dense[i][0], t), lerp(dense[i - 1][1], dense[i][1], t)]); next += step; }
+    acc += d;
+  }
+  return out;
+}
+
+/**
+ * 地面：纯函数、种子确定。
+ * opts = { seed, roads:[[x,z]...][] | null, hub:[x,z],
+ *          swell:16 (大尺度起伏振幅 m), undul:3.0 / hummock:0.30 (中/小尺度起伏振幅 m，调小=更平缓), swellFreq:0.0035 / swellOct:4 (大起伏的基频与倍频数，基频调低=更宽缓), rim:{start,end,amp,square} (边缘山脊；square=按方形边界), boundAmp:6 (软边界抬升，0=关), pad:{inner:7,outer:16} (丘顶平台半径/过渡带外沿),
+ *          palette:{lush,dry,dirt,rock} (线性反照率覆盖), dryBias:0 (<0 更绿) }
+ * 返回 heightAt / normalAt / roadInfo / splatAt / colorAt / groundInfoAt / cavityAt / attachRocks
+ */
+function makeGround(opts = {}) {
+  const seed = opts.seed ?? 1, hub = opts.hub ?? [0, 0], nz = makeNoise(seed);
+  const swellAmp = opts.swell ?? 16, swellFreq = opts.swellFreq ?? 0.0035, swellOct = opts.swellOct ?? 4, undulAmp = opts.undul ?? 3.0, humAmp = opts.hummock ?? 0.30, rimO = { start: 320, end: 900, amp: 70, square: false, ...(opts.rim ?? {}) }, boundAmp = opts.boundAmp ?? 6, padO = { inner: 7, outer: 16, ...(opts.pad ?? {}) }, dryBias = opts.dryBias ?? 0, pal = { ...PALETTE, ...(opts.palette ?? {}) };
+  const Ln = (x, z, oct, ox = 0, oz = 0) => nz.fbm2(x + ox, z + oz, oct);
+  const H0 = (x, z) => {
+    const r = Math.hypot(x - hub[0], z - hub[1]);
+    let H = swellAmp * Ln(x * swellFreq, z * swellFreq, swellOct) + undulAmp * Ln(x * 0.014, z * 0.014, 3, 31.7, -17.3) + humAmp * Ln(x * 0.07, z * 0.07, 2, -53.1, 11.9) + 4.2 * Math.exp(-((r / 40) ** 2));
+    const rr = rimO.square ? Math.max(Math.abs(x - hub[0]), Math.abs(z - hub[1])) : r, rs = rimO.amp > 0 ? smoothstep(rimO.start, rimO.end, rr) : 0;
+    if (rs > 0) {
+      let rim = nz.ridged2(x * 0.004 + 7.7, z * 0.004 - 3.1, 5) * rimO.amp * rs;
+      const cap = 0.7 * (110 + 40 * Ln(x * 0.002, z * 0.002, 1)) * (rimO.amp / 70);
+      if (rim > cap) rim = cap + (rim - cap) * 0.35;
+      H += rim;
+    }
+    return H;
+  };
+  const Hc = H0(hub[0], hub[1]);
+  const Hpre = (x, z) => {                                   // 丘顶压平 + 边界抬升（无路）
+    const r = Math.hypot(x - hub[0], z - hub[1]), c = smoothstep(padO.outer, padO.inner, r);
+    let h = H0(x, z);
+    if (c > 0) h = lerp(h, Hc + 0.03 * Ln(x * 0.5, z * 0.5, 1), c);
+    // BIBLE 把"边界抬升"写在修路之后；因 lerp(a+b, g+b, w) = lerp(a, g, w) + b，把它并入 Hpre 结果等价，且让路面 LUT(grade) 与最终路面一致
+    return boundAmp > 0 && r > 170 ? h + boundAmp * smoothstep(170, 240, r) * (0.6 + 0.4 * Ln(x * 0.01, z * 0.01, 1)) : h;
+  };
+  // ── 道路 LUT：0.5 m 采样 (x,z,s,grade)，grade 为沿线高度经 12 m 箱式滤波
+  const roadsPts = opts.roads === null ? [] : (opts.roads ?? [DEFAULT_ROAD]);
+  const roads = roadsPts.map((pts) => {
+    if (!Array.isArray(pts) || pts.length < 2 || pts.some((q) => !(Number.isFinite(q[0]) && Number.isFinite(q[1])))) throw new RangeError('道路需要 ≥2 个有限的 [x,z] 控制点');
+    const sm = splineSamples(pts, 0.5), n = sm.length, X = new Float32Array(n), Z = new Float32Array(n), S = new Float32Array(n), h = new Float64Array(n + 1);
+    for (let i = 0; i < n; i++) { X[i] = sm[i][0]; Z[i] = sm[i][1]; S[i] = i * 0.5; h[i + 1] = h[i] + Hpre(X[i], Z[i]); }
+    const G = new Float32Array(n);
+    for (let i = 0; i < n; i++) { const lo = Math.max(0, i - 12), hi = Math.min(n - 1, i + 12); G[i] = (h[hi + 1] - h[lo]) / (hi - lo + 1); }
+    return { x: X, z: Z, s: S, g: G, n, length: (n - 1) * 0.5 };
+  });
+  const CELL = 6, grid = new Map(), key = (cx, cz) => (cx + 4096) * 8192 + (cz + 4096);
+  let bx0 = Infinity, bx1 = -Infinity, bz0 = Infinity, bz1 = -Infinity;
+  roads.forEach((rd, ri) => {
+    for (let i = 0; i < rd.n; i++) {
+      const k = key(Math.floor(rd.x[i] / CELL), Math.floor(rd.z[i] / CELL));
+      let l = grid.get(k); if (!l) grid.set(k, (l = [])); l.push(ri * 65536 + i);
+      bx0 = Math.min(bx0, rd.x[i]); bx1 = Math.max(bx1, rd.x[i]); bz0 = Math.min(bz0, rd.z[i]); bz1 = Math.max(bz1, rd.z[i]);
+    }
+  });
+  const scratch = { d: Infinity, g: 0, s: 0, road: -1 };
+  /** 到最近道路的距离 d、该处路面高度 g、弧长 s（out 缺省复用同一个对象，调用方须立即取值） */
+  function roadInfo(x, z, out = scratch) {
+    out.d = Infinity; out.g = 0; out.s = 0; out.road = -1;
+    if (!roads.length || x < bx0 - CELL || x > bx1 + CELL || z < bz0 - CELL || z > bz1 + CELL) return out;
+    const cx = Math.floor(x / CELL), cz = Math.floor(z / CELL);
+    let best = Infinity, bi = -1, br = -1;
+    for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) {
+      const l = grid.get(key(cx + a, cz + b)); if (!l) continue;
+      for (const code of l) { const r = code >> 16, i = code & 65535, dx = x - roads[r].x[i], dz = z - roads[r].z[i], d2 = dx * dx + dz * dz; if (d2 < best) { best = d2; bi = i; br = r; } }
+    }
+    if (br < 0) return out;
+    const rd = roads[br]; let bd = Math.sqrt(best), bt = bi;
+    for (const j of [bi - 1, bi]) {                         // 精确到线段
+      if (j < 0 || j + 1 >= rd.n) continue;
+      const ax = rd.x[j], az = rd.z[j], ex = rd.x[j + 1] - ax, ez = rd.z[j + 1] - az, t = clamp(((x - ax) * ex + (z - az) * ez) / (ex * ex + ez * ez), 0, 1), d = Math.hypot(x - ax - ex * t, z - az - ez * t);
+      if (d < bd) { bd = d; bt = j + t; }
+    }
+    const i0 = Math.floor(bt), i1 = Math.min(rd.n - 1, i0 + 1), f = bt - i0;
+    out.d = bd; out.g = lerp(rd.g[i0], rd.g[i1], f); out.s = bt * 0.5; out.road = br;
+    return out;
+  }
+  function heightAt(x, z) {
+    let H = Hpre(x, z);
+    const ri = roadInfo(x, z);
+    if (ri.d < 4.5) H = lerp(H, ri.g, smoothstep(4.5, 1.6, ri.d) * 0.85) - 0.07 * smoothstep(1.3, 0.4, Math.abs(ri.d - 0.65));
+    return H;
+  }
+  function normalAt(x, z, out = [0, 1, 0]) {
+    const e = 0.3, hx = (heightAt(x + e, z) - heightAt(x - e, z)) / (2 * e), hz = (heightAt(x, z + e) - heightAt(x, z - e)) / (2 * e), l = Math.hypot(hx, 1, hz);
+    out[0] = -hx / l; out[1] = 1 / l; out[2] = -hz / l;
+    return out;
+  }
+  const cavityAt = (x, z, h = heightAt(x, z)) => {
+    const a = (heightAt(x + 3.5, z) + heightAt(x - 3.5, z) + heightAt(x, z + 3.5) + heightAt(x, z - 3.5)) / 4, b = (heightAt(x + 11, z) + heightAt(x - 11, z) + heightAt(x, z + 11) + heightAt(x, z - 11)) / 4;
+    return clamp((a - h) * 0.2 + (b - h) * 0.035, 0, 0.55);
+  };
+  let colliders = [];
+  /** §4.3 着色权重 [lush, dry, rock, dirt]（和为 1） */
+  function splatAt(x, z, n = normalAt(x, z), cav = 0) {
+    const r = Math.hypot(x - hub[0], z - hub[1]), O = nz.simplex2(x * 0.06, z * 0.06), Lm = Ln(x * 0.017, z * 0.017, 3);
+    let dB = Infinity; for (const c of colliders) dB = Math.min(dB, Math.hypot(x - c.x, z - c.z) - c.r);
+    let R = Math.max(smoothstep(0.26 + 0.08 * O, 0.45, 1 - n[1]), smoothstep(0.4, -0.4, dB));
+    let D = Math.max(smoothstep(3.4, 1.4, roadInfo(x, z).d), smoothstep(1.6, 0.6, dB) * 0.8, smoothstep(18, 8, r) * 0.35 * (0.5 + 0.5 * Lm));
+    let Y = clamp(0.55 + 0.9 * Ln(x * 0.012, z * 0.012, 3) + 0.25 * (n[0] * -SUN_DIR[0] + n[2] * -SUN_DIR[2]) - 0.6 * cav + dryBias, 0, 1);
+    D *= 1 - R; Y *= (1 - R) * (1 - D);
+    const lush = (1 - R) * (1 - D) * (1 - Y), s = lush + Y + R + D;
+    return [lush / s, Y / s, R / s, D / s];
+  }
+  function colorFromSplat(w, x, z) {
+    const v = 1 + 0.12 * Ln(x * 0.3, z * 0.3, 2), c = [0, 0, 0];
+    [pal.lush, pal.dry, pal.rock, pal.dirt].forEach((p, i) => { for (let k = 0; k < 3; k++) c[k] += w[i] * p[k]; });
+    return [c[0] * v, c[1] * v, c[2] * v];
+  }
+  function colorAt(x, z, n = normalAt(x, z), cav = 0) { return colorFromSplat(splatAt(x, z, n, cav), x, z); }
+  /** §4.3 tGround：草密度 / 高度系数 / 湿润度 / 洼地 AO */
+  function groundInfoAt(x, z) {
+    const n = normalAt(x, z), cav = cavityAt(x, z), w = splatAt(x, z, n, cav), r = Math.hypot(x - hub[0], z - hub[1]), pad = smoothstep(18, 8, r);
+    const density = (1 - w[2]) * (1 - smoothstep(0.3, 0.7, w[3])) * (0.55 + 0.45 * Ln(x * 0.05, z * 0.05, 1));
+    const moisture = clamp(cav * 1.6 + 0.3 * Ln(x * 0.01, z * 0.01, 1) - w[1] * 0.5, 0, 1);
+    const hf = 0.35 + 0.65 * smoothstep(-0.2, 0.6, Ln(x * 0.02, z * 0.02, 2) + moisture * 0.4) * (1 - 0.7 * pad);
+    return { density: clamp(density, 0, 1), heightFactor: hf, moisture, ao: 1 - cav };
+  }
+  return { seed, hub, Hc, roads, palette: pal, heightAt, normalAt, roadInfo, splatAt, colorAt, colorFromSplat, groundInfoAt, cavityAt, attachRocks(c) { colliders = c; } };
+}
+
+// ═════════════════════════════ 地形网格（§4.2） ═════════════════════════════
+/** 可分离网格轴：|x|≤inner 内均匀 step（427 列），之外按 growth 几何增长到 ±outer */
+function makeAxis({ inner = 160, step = 0.75, growth = 1.045, outer = 1500 } = {}) {
+  const n = Math.floor(inner / step), mid = [];
+  for (let i = -n; i <= n; i++) mid.push(i * step);
+  const right = []; let x = n * step, d = step;
+  while (x < outer) { d *= growth; x = Math.min(outer, x + d); right.push(x); }
+  return Float64Array.from([...right.slice().reverse().map((v) => -v), ...mid, ...right]);
+}
+/** 只采样高度（约 14 万次求值，亚秒级）：游戏用它做"与渲染网格严格一致"的 terrainHeight */
+function sampleHeights(ground, axis = makeAxis()) {
+  const nx = axis.length, H = new Float32Array(nx * nx);
+  for (let j = 0; j < nx; j++) for (let i = 0; i < nx; i++) H[j * nx + i] = ground.heightAt(axis[i], axis[j]);
+  return { axis, cols: nx, rows: nx, heights: H };
+}
+/** 顶点 = 解析高度(或 o.heights 复用)；法线 = 解析 normalAt（o.gridNormals=true 时改用栅格差分）；颜色 = 着色权重烘出的远景反照率；棋盘格对角线 */
+function buildTerrain(ground, o = {}) {
+  const ax = o.axis ?? makeAxis(o.axisOpts), nx = ax.length, nv = nx * nx;
+  const P = new Float32Array(nv * 3), N = new Float32Array(nv * 3), C = o.colors === false ? null : new Float32Array(nv * 3), S = o.splat ? new Float32Array(nv * 4) : null, tmp = [0, 1, 0];
+  for (let j = 0; j < nx; j++) {
+    for (let i = 0; i < nx; i++) {
+      const x = ax[i], z = ax[j], k = j * nx + i, y = o.heights ? o.heights[k] : ground.heightAt(x, z);
+      P[3 * k] = x; P[3 * k + 1] = y; P[3 * k + 2] = z;
+      if (o.gridNormals && o.heights) {                       // 与几何一致的栅格差分法线（不额外求值，约快 4 倍）
+        const H = o.heights, i0 = i > 0 ? i - 1 : i, i1 = i < nx - 1 ? i + 1 : i, j0 = j > 0 ? j - 1 : j, j1 = j < nx - 1 ? j + 1 : j;
+        const gx = (H[j * nx + i1] - H[j * nx + i0]) / (ax[i1] - ax[i0]), gz = (H[j1 * nx + i] - H[j0 * nx + i]) / (ax[j1] - ax[j0]), l = Math.hypot(gx, 1, gz);
+        tmp[0] = -gx / l; tmp[1] = 1 / l; tmp[2] = -gz / l;
+      } else ground.normalAt(x, z, tmp);
+      N[3 * k] = tmp[0]; N[3 * k + 1] = tmp[1]; N[3 * k + 2] = tmp[2];
+      if (C || S) {
+        const w = ground.splatAt(x, z, tmp, Math.abs(x) < 200 && Math.abs(z) < 200 && o.cavity !== false ? ground.cavityAt(x, z, y) : 0);
+        if (S) { S[4 * k] = w[0]; S[4 * k + 1] = w[1]; S[4 * k + 2] = w[2]; S[4 * k + 3] = w[3]; }
+        if (C) { const c = ground.colorFromSplat(w, x, z); C[3 * k] = c[0]; C[3 * k + 1] = c[1]; C[3 * k + 2] = c[2]; }
+      }
+    }
+  }
+  const I = new Uint32Array(6 * (nx - 1) * (nx - 1));
+  let t = 0;
+  for (let j = 0; j < nx - 1; j++) {
+    for (let i = 0; i < nx - 1; i++) {
+      const a = j * nx + i, b = a + 1, d = a + nx, c = d + 1;
+      if ((i + j) & 1) { I[t++] = a; I[t++] = d; I[t++] = c; I[t++] = a; I[t++] = c; I[t++] = b; }
+      else { I[t++] = a; I[t++] = d; I[t++] = b; I[t++] = b; I[t++] = d; I[t++] = c; }
+    }
+  }
+  const m = { positions: P, normals: N, indices: I, axis: ax, cols: nx, rows: nx };
+  if (C) m.colors = C;
+  if (S) m.splat = S;
+  return m;
+}
+/** 在网格上按其真实三角划分取高度。m 可以是 buildTerrain 的结果，也可以是 sampleHeights 的结果；坐标越界时夹到边缘 */
+function terrainHeightFromMesh(m, x, z) {
+  const ax = m.axis, nx = m.cols, H = m.heights, P = m.positions, find = (v) => { let lo = 0, hi = ax.length - 1; while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (ax[mid] <= v) lo = mid; else hi = mid; } return lo; };
+  x = clamp(x, ax[0], ax[nx - 1]); z = clamp(z, ax[0], ax[nx - 1]);
+  const i = find(x), j = find(z), u = (x - ax[i]) / (ax[i + 1] - ax[i]), v = (z - ax[j]) / (ax[j + 1] - ax[j]), Y = H ? (ii, jj) => H[jj * nx + ii] : (ii, jj) => P[3 * (jj * nx + ii) + 1];
+  const ya = Y(i, j), yb = Y(i + 1, j), yd = Y(i, j + 1), yc = Y(i + 1, j + 1);
+  if ((i + j) & 1) return u >= v ? ya + u * (yb - ya) + v * (yc - yb) : ya + v * (yd - ya) + u * (yc - yd);   // 对角线 a–c
+  return u + v <= 1 ? ya + u * (yb - ya) + v * (yd - ya) : yc + (1 - u) * (yd - yc) + (1 - v) * (yb - yc);          // 对角线 b–d
+}
+
+// ═════════════════════════════ 岩石（§4.6） ═════════════════════════════
+/** 6 个原型：二十面体细分球 + 脊状 3D fBm·0.35 + 层理台阶噪声，底部压平，法线重算；hi / lo 两档 LOD 同形 */
+function makeRockPrototypes({ seed = 777, hi = 4, lo = 2 } = {}) {
+  return Array.from({ length: 6 }, (_, p) => {
+    const nz = makeNoise(seed + p * 13), rnd = mulberry32(seed + p * 31);
+    const asp = [1 + 0.25 * (rnd() - 0.5), 0.7 + 0.3 * rnd(), 1 + 0.25 * (rnd() - 0.5)], strata = 0.02 + 0.03 * rnd(), kk = 3.5 + 3 * rnd(), off = rnd() * 50;
+    const build = (level) => {
+      const m = icosphere(level), P = m.positions;
+      for (let i = 0; i < P.length; i += 3) {
+        const ux = P[i], uy = P[i + 1], uz = P[i + 2], t = uy * kk + 0.9 * nz.simplex3(ux * 1.3 + off, uy * 1.3, uz * 1.3);
+        const r = 1 + 0.35 * (nz.ridged3(ux * 1.7 + off, uy * 1.7, uz * 1.7, 4) - 0.45) + strata * (t - Math.floor(t) - 0.5);
+        let y = uy * r * asp[1]; const yf = -0.5 * asp[1];
+        if (y < yf) y = yf + (y - yf) * 0.12;                 // 压平底部
+        P[i] = ux * r * asp[0]; P[i + 1] = y; P[i + 2] = uz * r * asp[2];
+      }
+      return computeNormals(m);
+    };
+    const hiM = build(hi), loM = build(lo), b = bounds(hiM);
+    return { id: p, hi: hiM, lo: loM, asp, ymin: b.min[1], ymax: b.max[1], radius: Math.max(b.max[0], b.max[2], -b.min[0], -b.min[2]) };
+  });
+}
+/** 列主序 4×4：T · R(对齐法线, 绕法线偏航) · S */
+function composeMatrix(pos, yaw, sc, n = [0, 1, 0]) {
+  const f0 = [Math.sin(yaw), 0, Math.cos(yaw)], right = v3.norm(v3.cross(n, f0)), fwd = v3.cross(right, n), m = new Float32Array(16);
+  m.set([right[0] * sc[0], right[1] * sc[0], right[2] * sc[0], 0, n[0] * sc[1], n[1] * sc[1], n[2] * sc[1], 0, fwd[0] * sc[2], fwd[1] * sc[2], fwd[2] * sc[2], 0, pos[0], pos[1], pos[2], 1]);
+  return m;
+}
+/** 摆放（seed 777）：5–12 主石 + 每块 3–9 碎石(±2.2 m) + 2–3 立石(y×2.5) + 远处坡面露头；全部 normal.y≥0.72、下沉 25–50% */
+function placeRocks(ground, protos, { seed = 777 } = {}) {
+  const rnd = mulberry32(seed), inst = [], coll = [], hub = ground.hub;
+  const find = (gen, minRoad, tries = 60) => {
+    for (let t = 0; t < tries; t++) { const [x, z] = gen(), n = ground.normalAt(x, z); if (n[1] >= 0.72 && ground.roadInfo(x, z).d > minRoad) return { x, z, n }; }
+    return null;
+  };
+  const add = (kind, proto, x, z, n, radius, ySquash, align) => {
+    const p = protos[proto], sc = [radius, radius * ySquash, radius * (0.8 + 0.4 * rnd())], sink = 0.25 + 0.25 * rnd(), g = ground.heightAt(x, z), hProto = (p.ymax - p.ymin) * sc[1];
+    const y = g - sink * hProto - p.ymin * sc[1], yaw = rnd() * TAU;
+    inst.push({ kind, proto, x, y, z, scale: sc, yaw, sink, groundY: g, normalY: n[1], matrix: composeMatrix([x, y, z], yaw, sc, align ? n : [0, 1, 0]) });
+    return radius;
+  };
+  const nHero = 5 + Math.floor(rnd() * 8);
+  for (let h = 0; h < nHero; h++) {
+    const edge = h < Math.ceil(nHero / 3), radius = 1.5 + rnd() * 2.5;
+    const spot = find(() => { const a = rnd() * TAU, r = edge ? 18 + rnd() * 22 : 40 + rnd() * 110; return [hub[0] + Math.cos(a) * r, hub[1] + Math.sin(a) * r]; }, radius + 3);
+    if (!spot) continue;
+    add('hero', Math.floor(rnd() * 6), spot.x, spot.z, spot.n, radius, 0.7 + 0.3 * rnd(), false);
+    coll.push({ x: spot.x, z: spot.z, r: radius * 0.9 });
+    const nd = 3 + Math.floor(rnd() * 7);
+    for (let d = 0; d < nd; d++) {
+      const s = find(() => [spot.x + (rnd() * 2 - 1) * 2.2, spot.z + (rnd() * 2 - 1) * 2.2], 1.5, 12);
+      if (s) add('debris', Math.floor(rnd() * 6), s.x, s.z, s.n, 0.15 + rnd() * 0.45, 0.6 + 0.4 * rnd(), false);
+    }
+  }
+  const road = ground.roads[0], nStand = 2 + Math.floor(rnd() * 2);
+  for (let s = 0; road && s < nStand; s++) {
+    const spot = find(() => {
+      const i = Math.floor(rnd() * road.n), j = Math.min(road.n - 1, i + 1), tx = road.x[j] - road.x[i], tz = road.z[j] - road.z[i], l = Math.hypot(tx, tz) || 1, side = (rnd() < 0.5 ? -1 : 1) * (4 + rnd() * 4);
+      return [road.x[i] - (tz / l) * side, road.z[i] + (tx / l) * side];
+    }, 3, 80);
+    if (!spot) continue;
+    const radius = 0.5 + rnd() * 0.4;
+    add('standing', Math.floor(rnd() * 6), spot.x, spot.z, spot.n, radius, 2.5, false);
+    coll.push({ x: spot.x, z: spot.z, r: radius });
+  }
+  for (let t = 0, got = 0; t < 600 && got < 24; t++) {                                // 远处陡坡露头，对齐地面法线
+    const a = rnd() * TAU, r = 300 + rnd() * 400, x = hub[0] + Math.cos(a) * r, z = hub[1] + Math.sin(a) * r, n = ground.normalAt(x, z);
+    if (n[1] < 0.8) { add('outcrop', Math.floor(rnd() * 6), x, z, n, 3 + rnd() * 5, 0.6 + 0.3 * rnd(), true); got++; }
+  }
+  ground.attachRocks(coll);
+  return { instances: inst, colliders: coll };
+}
+
+// ═════════════════════════════ 远山环带（§3.2） ═════════════════════════════
+const MOUNTAIN_LAYERS = [
+  { radius: 1800, H: 160, base: -10, depth: 260, haze: 0.30 },
+  { radius: 2400, H: 320, base: -20, depth: 360, haze: 0.50 },
+  { radius: 3200, H: 520, base: -40, depth: 500, haze: 0.66, snow: true },
+  { radius: 4200, H: 780, base: -60, depth: 500, haze: 0.78 },
+];
+const wrapPI = (a) => a - TAU * Math.floor((a + Math.PI) / TAU);
+/** 4 层 360° 环带（各 481×11 顶点）；颜色已烘入 森林→岩石→雪 反照率、环境+日照、雾霾混合（公式见 BIBLE §3.2） */
+function buildMountainRings({ seed = 5, sunDir = SUN_DIR, fogColor = [0.50, 0.42, 0.33], layers = MOUNTAIN_LAYERS, cols = 480, rows = 10, bake = true, albedoScale = 1 } = {}) {
+  const nz = makeNoise(seed), thSun = Math.atan2(sunDir[0], sunDir[2]);
+  return layers.map((Ly, li) => {
+    const nC = cols + 1, nR = rows + 1, nv = nC * nR, P = new Float32Array(nv * 3), UV = new Float32Array(nv * 2), relH = new Float32Array(nv), fb = new Float32Array(nv);
+    for (let i = 0; i < nC; i++) {
+      const th = (TAU * i) / cols, cx = Math.cos(th) * 2.45, sx = Math.sin(th) * 2.45, d = Math.abs(wrapPI(th - thSun));
+      const notch = 1 - 0.55 * Math.exp(-((d / 0.2) ** 2)), az = 0.65 + 0.35 * smoothstep(0.3, 1.2, d);
+      for (let j = 0; j < nR; j++) {
+        const E = j / rows, k = i * nR + j, rid = nz.ridged3(cx + li * 13.1, sx - li * 7.7, E * 1.2 + li * 3.3, 6), f = nz.fbm3(cx * 1.3 + 5.5 + li, sx * 1.3 - 2.2, E * 1.1 + 9.9, 3);
+        const amp = (0.25 + 0.95 * rid * (0.55 + 0.45 * f)) * notch * az * Math.sin(Math.min(1, E * 2.2 + 0.05) * Math.PI / 2), R = Ly.radius + Ly.depth * E;
+        P[3 * k] = R * Math.sin(th); P[3 * k + 1] = Ly.base + Ly.H * amp; P[3 * k + 2] = R * Math.cos(th);
+        UV[2 * k] = i / cols; UV[2 * k + 1] = E; relH[k] = clamp(amp, 0, 1); fb[k] = f;
+      }
+    }
+    const I = new Uint32Array(6 * cols * rows); let t = 0;
+    for (let i = 0; i < cols; i++) for (let j = 0; j < rows; j++) { const a = i * nR + j, b = (i + 1) * nR + j, c = b + 1, d = a + 1; I[t++] = a; I[t++] = c; I[t++] = b; I[t++] = a; I[t++] = d; I[t++] = c; }
+    const m = computeNormals({ positions: P, uvs: UV, indices: I }), C = new Float32Array(nv * 3), N = m.normals, snow = new Uint8Array(nv);
+    for (let i = 0; i < nC; i++) {
+      const th = (TAU * i) / cols, anti = Math.abs(wrapPI(th - thSun - Math.PI)) < 0.873;
+      for (let j = 0; j < nR; j++) {
+        const k = i * nR + j, h = relH[k], ny = N[3 * k + 1], tt = smoothstep(0.1, 0.8, h);
+        let alb = [lerp(0.035, 0.09, tt), lerp(0.05, 0.085, tt), lerp(0.045, 0.08, tt)];
+        if (Ly.snow && anti && h > 0.62 + 0.1 * fb[k] && ny > 0.55) { alb = [0.8, 0.8, 0.82]; snow[k] = 1; } else if (albedoScale !== 1) alb = alb.map((v) => Math.min(1, v * albedoScale));
+        const ndl = Math.max(0, N[3 * k] * sunDir[0] + ny * sunDir[1] + N[3 * k + 2] * sunDir[2]), amb = [0.30, 0.38, 0.46], sun = [3.3, 3.3 * 0.74, 3.3 * 0.47];
+        const haze = Math.min(0.985, Ly.haze + (1 - Ly.haze) * (1 - smoothstep(0, 0.55, h)) * 0.65 + (1 - h) * 0.08);
+        if (!bake) { for (let c = 0; c < 3; c++) C[3 * k + c] = alb[c]; continue; }
+        for (let c = 0; c < 3; c++) {
+          const lit = alb[c] * (amb[c] * (0.55 + 0.45 * ny) + sun[c] * ndl * 0.55) + Math.pow(ndl, 3) * 0.02 * h;
+          C[3 * k + c] = lerp(lit, fogColor[c], haze);
+        }
+      }
+    }
+    m.colors = C; m.relH = relH; m.snow = snow; m.cols = nC; m.rows = nR; m.layer = li; m.haze = Ly.haze; m.radius = Ly.radius;
+    return m;
+  });
+}
+
+// ───── xiyou-character.js ─────
 // xiyou-character.js — 重走西游 · 人物建模（程序化、纯数据；接入 THREE 见 xiyou-three.js）
 // 依据 BIBLE §7.2：米制骨架(Mixamo 风格命名)；躯干 14 环、四肢 8 环、16 边的椭圆放样；
 // 距离权重蒙皮(2~4 影响、归一化、2 次拉普拉斯平滑)；手为低模连指手套(拇指/食指/中指/无名+小指各 2 节)。
 // 静止姿态 = A 字站姿，所有骨骼静止旋转为单位四元数 → 动画层用"相对静止姿态的欧拉偏移"即可。
-
 const rad = (d) => (d * Math.PI) / 180;
 
 // ═════════════════════════════ 比例 / 骨架 ═════════════════════════════
@@ -2978,7 +3323,7 @@ const PARTS = {
       const dCut = z > -0.02 * k && y > yB - 0.05 ? x - xl(y) : 9, d = Math.min(dCut, y - yBot), t = smoothstep(0.012 * k, 0.026 * k, d);
       return [lerp(o.trim[0], o.color[0], t), lerp(o.trim[1], o.color[1], t), lerp(o.trim[2], o.color[2], t)];
     });
-    return { name: 'kasaya', mesh: m, material: mat.cloth([1, 1, 1]), skin: ROBE_BONES };
+    return { name: 'kasaya', mesh: m, material: mat.cloth([1, 1, 1]), skin: ROBE_BONES, dyn: 'drape' };
   },
   /** 腰带 +（可选）两条 0.6 m 飘带 */
   sash(ctx, o) {
@@ -2988,7 +3333,7 @@ const PARTS = {
       const t = torsoAt(L, 0.60), y0 = L.Y(0.60), x0 = 0.70 * t.rx, z0 = t.cz + t.rz * 0.72 + 0.036 * k;
       for (const [dx, len, sw] of [[0, 0.60, 0.02], [0.055, 0.48, -0.03]]) {
         const m = gridPanel(6, 1, (u, v) => [x0 + dx * k + (u - 0.5) * 0.07 * k + sw * k * v, y0 - v * len * k, z0 + 0.02 * k * v]);
-        out.push({ name: 'sashTails', mesh: m, material: mat.cloth(o.color), skin: ['pelvis', 'spine1', 'thigh_L', 'thigh_R'], cloth: { rows: 6, cols: 1, pin: 0 } });
+        out.push({ name: 'sashTails', mesh: m, material: mat.cloth(o.color), skin: ['pelvis', 'spine1', 'thigh_L', 'thigh_R'], cloth: { rows: 6, cols: 1, pin: 0 }, dyn: 'tails' });
       }
     }
     return out;
@@ -3000,7 +3345,7 @@ const PARTS = {
       const phi = (u - 0.5) * arc;
       return [(t.rx + 0.03 * k) * Math.sin(phi) * (1 + 0.45 * v), top - v * len, -((t.rz + 0.034 * k) * Math.cos(phi)) * (1 + 0.8 * v) - 0.05 * k * v];
     });
-    return { name: 'cape', mesh: m, material: mat.cloth(o.color), skin: BACK_BONES, cloth: { rows, cols, pin: 0 } };
+    return { name: 'cape', mesh: m, material: mat.cloth(o.color), skin: BACK_BONES, cloth: { rows, cols, pin: 0 }, dyn: 'cape' };
   },
   /** 虎皮裙：锯齿下摆 + 顶点色虎纹 */
   tigerSkirt(ctx, o = {}) {
@@ -3092,7 +3437,7 @@ const PARTS = {
     if (o.long) {
       const rings = [[0, h.c[1] - 0.01 * k, h.c[2] - h.rz * 0.92, 0.070, 0.026], [0, L.Y(0.80), -0.115 * k, 0.085, 0.030], [0, L.Y(0.75), -0.135 * k, 0.092, 0.030], [0, L.Y(0.70), -0.14 * k, 0.07, 0.024], [0, L.Y(0.665), -0.135 * k, 0.025, 0.014]]
         .map(([x, y, z, a, b]) => ({ c: [x, y, z], ra: a * k, rb: b * k }));
-      out.push({ name: 'hair', mesh: loft(rings, { sides: 12, cap: 'end' }), material: mat.hair(o.color), skin: ['head', 'neck', 'chest', 'spine2'] });
+      out.push({ name: 'hairLong', mesh: loft(rings, { sides: 12, cap: 'end' }), material: mat.hair(o.color), skin: ['head', 'neck', 'chest', 'spine2'], dyn: 'hair' });
     }
     return out;
   },
@@ -3272,7 +3617,15 @@ function buildCharacterData({ kind = 'tangseng', seed = 0, override = null } = {
     if (!skip.has('legs')) P('skin', legMesh(ctx, s), skinMat, { skin: legBones(s) });
     P('skin', handMesh(ctx, s), skinMat, { skin: handBones(s) });
   }
-  eyeMeshes(ctx).forEach((e) => P('eyes', e, mat.eye(spec.eye), { rigid: 'head' }));
+  // 眼睛：骨骼 eye_L / eye_R 放在眼球中心（眨眼 = 沿 Y 压扁；视线 = 微小平移）
+  const eyes = eyeMeshes(ctx);
+  eyes.forEach((e, i) => {
+    let cx = 0, cy = 0, cz = 0; const n = e.positions.length / 3;
+    for (let v = 0; v < n; v++) { cx += e.positions[3 * v]; cy += e.positions[3 * v + 1]; cz += e.positions[3 * v + 2]; }
+    const c = [cx / n, cy / n, cz / n], name = i === 0 ? 'eye_L' : 'eye_R';
+    sk.bones.push({ name, parent: sk.index.head, pos: c, tail: [c[0], c[1], c[2] + 0.01 * k] }); sk.index[name] = sk.bones.length - 1;
+    P('eyes', e, mat.eye(spec.eye), { rigid: name });
+  });
   // 2) 服装 / 配饰
   for (const [type, o] of spec.parts) {
     if (!PARTS[type]) throw new Error(`未知构件 ${type}`);
@@ -3289,14 +3642,14 @@ function buildCharacterData({ kind = 'tangseng', seed = 0, override = null } = {
   const groups = new Map();
   for (const p of pieces) {
     if (p.skin) skinMesh(p.mesh, p.skin, sk, k, p.skinOpts); else rigidMesh(p.mesh, p.rigid, sk);
-    const g = groups.get(p.name) ?? { name: p.name, meshes: [], material: p.material, cloth: p.cloth ? { ...p.cloth, panels: 0 } : undefined };
+    const g = groups.get(p.name) ?? { name: p.name, meshes: [], material: p.material, dyn: p.dyn, cloth: p.cloth ? { ...p.cloth, panels: 0 } : undefined };
     if (p.cloth) g.cloth.panels++;                       // 同名布料合并成一个部件：panels 块，每块 (rows+1)*(cols+1) 个顶点，按顺序排列
     g.meshes.push(p.mesh); groups.set(p.name, g);
   }
   const parts = [...groups.values()].map((g) => {
     const mesh = g.meshes.length === 1 ? g.meshes[0] : mergeMeshes(g.meshes);
     if (g.name === 'skin' && spec.skinTint === 'monkey') tintMonkey(ctx, mesh);
-    return { name: g.name, ...mesh, material: g.material, ...(g.cloth ? { cloth: g.cloth } : {}) };
+    return { name: g.name, ...mesh, material: g.material, ...(g.cloth ? { cloth: g.cloth } : {}), ...(g.dyn ? { dyn: g.dyn } : {}) };
   });
   // 5) 受击胶囊（骨骼局部偏移；静止朝向为单位旋转）
   const hk = L.headK, capsules = [
@@ -3309,7 +3662,7 @@ function buildCharacterData({ kind = 'tangseng', seed = 0, override = null } = {
   ];
   let vertices = 0, triangles = 0;
   for (const p of parts) { vertices += p.positions.length / 3; triangles += p.indices.length / 3; }
-  return { kind, name: spec.zh, height: L.H, seed, layout: { k, hipY: L.hipY, head: L.head, grip: L.J.grip }, skeleton: sk, parts, capsules, weapon, stats: { vertices, triangles, parts: parts.length } };
+  return { kind, name: spec.zh, height: L.H, seed, layout: { k, hipY: L.hipY, head: L.head, grip: L.J.grip, legT: L.legT, thick: L.thick, hw: L.hw, sw: L.sw }, skeleton: sk, parts, capsules, weapon, stats: { vertices, triangles, parts: parts.length } };
 }
 
 
@@ -3359,360 +3712,694 @@ function poseData(data, pose) {
   return { ...data, parts };
 }
 
+/** PBR 分层材质规格（纯数据；由 xiyou-three.js 的 makeMaterial 转成 THREE 材质）。颜色都在顶点色里，material.color 恒为白 */
+const PBR = {
+  skin: { kind: 'skin', roughness: 0.58, metalness: 0, envMapIntensity: 0.35, side: 'front', normalMap: { kind: 'pore', tile: [9, 9], scale: 0.35 } },
+  fur: { kind: 'fur', roughness: 0.72, metalness: 0, envMapIntensity: 0.35, anisotropy: 0.45, side: 'front', normalMap: { kind: 'fur', tile: [8, 8], scale: 0.8 } },
+  hair: { kind: 'hair', roughness: 0.46, metalness: 0, envMapIntensity: 0.4, anisotropy: 0.65, sheen: 0.3, sheenColor: [1.0, 0.72, 0.4], sheenRoughness: 0.5, side: 'double', normalMap: { kind: 'strand', tile: [3, 6], scale: 0.6 } },
+  cloth: { kind: 'cloth', roughness: 0.85, metalness: 0, envMapIntensity: 0.35, sheen: 0.7, sheenColor: [1.0, 0.72, 0.28], sheenRoughness: 0.5, side: 'double', normalMap: { kind: 'weave', tile: [3, 3], scale: 0.3 } },
+  metal: { kind: 'metal', roughness: 0.22, metalness: 0.92, envMapIntensity: 1.5, side: 'front' },
+  gloss: { kind: 'gloss', roughness: 0.06, metalness: 0, envMapIntensity: 1.0, clearcoat: 1, clearcoatRoughness: 0.04, side: 'front' },
+  matte: { kind: 'matte', roughness: 0.8, metalness: 0.02, envMapIntensity: 0.3, side: 'double' },
+};
+const bucketOf = (p) => { const k = p.material.kind; return k === 'metal' ? 'metal' : k === 'eye' ? 'gloss' : k === 'skin' ? (p.colors ? 'fur' : 'skin') : k === 'hair' ? 'hair' : k === 'cloth' ? 'cloth' : 'matte'; };
+
+/** 模型空间(静止姿态)的身体碰撞体：躯干、头、两条大腿与小腿（半径略小于衣壳的静止距离，不会把静止形状顶变形） */
+function bodyColliders(data, { legs = true } = {}) {
+  const sk = data.skeleton, L = data.layout, k = L.k, B = (n) => sk.bones[sk.index[n]].pos, out = [];
+  out.push({ tag: 'torso', a: B('pelvis'), b: B('chest'), r: 0.105 * k * L.thick });
+  out.push({ tag: 'head', a: [L.head.c[0], L.head.c[1], L.head.c[2]], b: [L.head.c[0], L.head.c[1], L.head.c[2]], r: Math.min(L.head.rx, L.head.rz) * 0.95 });
+  if (legs) for (const s of ['L', 'R']) {
+    out.push({ tag: 'thigh', a: B('thigh_' + s), b: B('shin_' + s), r: 0.068 * k * L.legT });
+    out.push({ tag: 'shin', a: B('shin_' + s), b: B('foot_' + s), r: 0.044 * k * L.legT });
+  }
+  return out;
+}
+/** 各类动态部件的"跟随骨骼"程度 pin(0..1)：披风/飘带只固定顶排，袈裟固定腰以上，长发固定发根 */
+function dynPins(p, type, data) {
+  const P = p.positions, n = P.length / 3, pin = new Float32Array(n), H = data.height, hipY = data.layout.hipY;
+  const Yf = (f) => (f <= 0.53 ? (f * hipY) / 0.53 : hipY + ((f - 0.53) * (H - hipY)) / 0.47);
+  if (type === 'drape') { const y0 = Yf(0.40), y1 = Yf(0.56); for (let i = 0; i < n; i++) pin[i] = smoothstep(y0, y1, P[3 * i + 1]); return pin; }
+  if (type === 'hair') { const per = 13, ring = [1, 0.45, 0.15, 0, 0]; for (let i = 0; i < n; i++) pin[i] = ring[Math.min(Math.floor(i / per), ring.length - 1)] ?? 0; return pin; }
+  let top = -Infinity, bot = Infinity; for (let i = 0; i < n; i++) { top = Math.max(top, P[3 * i + 1]); bot = Math.min(bot, P[3 * i + 1]); }
+  const rows = p.cloth?.rows ?? 10, step = Math.max(1e-6, (top - bot) / rows);
+  for (let i = 0; i < n; i++) pin[i] = clamp(1 - 0.55 * ((top - P[3 * i + 1]) / step), 0, 1);       // 顶排 1、第二排 ≈0.45、其余自由
+  return pin;
+}
 /**
- * 把角色合并烘焙为 ≤3 个网格（matte 哑光 / metal 金属 / gloss 眼睛），颜色全部进顶点色 → 每个角色只需 2~3 次绘制。
- * colorScale 用来把"低反照率"的 BIBLE 配色提亮以适配更亮的光照。蒙皮属性一并保留。
+ * 把角色烘焙成：≤7 个 PBR 分层网格桶（skin/fur/hair/cloth/metal/gloss/matte，颜色进顶点色 → 每个角色只需几次绘制）
+ * + 动态部件 dynamic[]（披风/飘带/袈裟/长发：单独网格，附 pin 与类型，交给 Cloth 仿真）。蒙皮属性一并保留。
+ * opts.colorScale 把低反照率配色提亮；opts.dynamic 指定哪些类型保持动态（骑马姿态下袈裟下摆不仿真，可去掉 'drape'）。
  */
-function bakeCharacter(data, { colorScale = 1 } = {}) {
-  const groups = { matte: [], metal: [], gloss: [] };
+function bakeCharacter(data, { colorScale = 1, dynamic = ['cape', 'tails', 'drape', 'hair'], legsColliders = true } = {}) {
+  const groups = {}, dyn = [];
   for (const p of data.parts) {
     const nv = p.positions.length / 3, C = new Float32Array(nv * 3), base = p.material.color;
     for (let i = 0; i < nv; i++) for (let c = 0; c < 3; c++) C[3 * i + c] = Math.min(1, (p.colors ? p.colors[3 * i + c] * base[c] : base[c]) * colorScale);
-    const kind = p.material.kind;
-    groups[kind === 'metal' ? 'metal' : kind === 'eye' ? 'gloss' : 'matte'].push({ ...p, colors: C });
+    const q = { ...p, colors: C };
+    if (p.dyn && dynamic.includes(p.dyn)) {
+      const spec = { ...PBR[p.material.kind === 'hair' ? 'hair' : 'cloth'], side: 'double' };
+      dyn.push({ name: p.name, type: p.dyn, mesh: { positions: q.positions, normals: q.normals, uvs: q.uvs, indices: q.indices, colors: C }, material: spec, pin: dynPins(q, p.dyn, data) });
+      continue;
+    }
+    (groups[bucketOf(p)] ??= []).push(q);
   }
-  const spec = {
-    matte: { kind: 'matte', color: [1, 1, 1], roughness: 0.85, metalness: 0.02, side: 'double' },
-    metal: { kind: 'metal', color: [1, 1, 1], roughness: 0.35, metalness: 0.85, side: 'front' },
-    gloss: { kind: 'gloss', color: [1, 1, 1], roughness: 0.15, metalness: 0, side: 'front' },
-  };
   const buckets = [];
-  for (const [name, list] of Object.entries(groups)) if (list.length) buckets.push({ name, mesh: mergeMeshes(list), material: spec[name] });
-  return { kind: data.kind, name: data.name, height: data.height, layout: data.layout, weapon: data.weapon, capsules: data.capsules, skeleton: data.skeleton, buckets };
+  for (const [name, list] of Object.entries(groups)) buckets.push({ name, mesh: mergeMeshes(list), material: { ...PBR[name], color: [1, 1, 1] } });
+  return { kind: data.kind, name: data.name, height: data.height, layout: data.layout, weapon: data.weapon, capsules: data.capsules, skeleton: data.skeleton, buckets, dynamic: dyn, colliders: bodyColliders(data, { legs: legsColliders }) };
 }
 
-// ──────── xiyou-world.js ────────
-// xiyou-world.js — 重走西游 · 环境建模（纯数据、种子确定；接入 THREE 见 xiyou-three.js）
-// 依据 BIBLE §4.1 高度函数 / §4.2 可分离网格 / §4.3 着色权重 / §4.6 岩石 / §3.2 远山环带。
-// 道路 = 若干条折线控制点（Catmull-Rom），由你的"每局路网生成器"传入；本模块只负责把路压进地形、出 LUT、出权重。
+// ───── xiyou-motion.js ─────
+// xiyou-motion.js — 重走西游 · 人物动态与物理仿真（纯数学，零 THREE 依赖）
+// 内容：阻尼弹簧 / 程序化呼吸·微动·眨眼 / 白龙马步态 / 骑手鞍座阻尼跟随 / 风场 / 通用 Verlet(PBD) 布料毛发仿真器。
+// 约定：矩阵为列主序 4×4（与 THREE.Matrix4.elements 相同）；骨骼静止朝向为单位旋转，动画 = 相对静止姿态的欧拉偏移。
+/** Unity 风格临界阻尼平滑。st = { v:0 } 保存速度；返回新值 */
+function smoothDamp(cur, target, st, smoothTime, dt, maxSpeed = Infinity) {
+  smoothTime = Math.max(1e-4, smoothTime);
+  const w = 2 / smoothTime, x = w * dt, e = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x), maxChange = maxSpeed * smoothTime;
+  const change = clamp(cur - target, -maxChange, maxChange), tgt = cur - change, temp = (st.v + w * change) * dt;
+  st.v = (st.v - w * temp) * e;
+  let out = tgt + (change + temp) * e;
+  if (target - cur > 0 === out > target) { out = target; st.v = dt > 0 ? (out - target) / dt : 0; }
+  return out;
+}
+const expo = (lambda, dt) => 1 - Math.exp(-lambda * dt);
+const safeDt = (dt, max) => (Number.isFinite(dt) ? clamp(dt, 0, max) : 0);       // NaN/负数/超大 → 0 或上限
+const h3 = (x, y, z) => Math.sqrt(x * x + y * y + z * z);                        // 比 Math.hypot 快得多，热循环里用
 
-const SUN_DIR = v3.norm([-0.6, 0.165, -0.78]);
-const WIND_DIR = [0.62, 0.78];
-const DEFAULT_ROAD = [[-420, 130], [-220, 75], [-70, 38], [0, 30], [80, 12], [190, -55], [420, -150]];
-/** 线性反照率（BIBLE §4.4 的目标范围） */
-const PALETTE = { lush: [0.08, 0.11, 0.035], dry: [0.20, 0.145, 0.055], dirt: [0.16, 0.12, 0.08], rock: [0.18, 0.17, 0.155] };
-
-/** 由种子生成一条蜿蜒的路（控制点）；每局换种子即换路 */
-function generateRoad(seed, o = {}) {
-  const rnd = mulberry32(seed), step = o.step ?? 110, n = o.points ?? 9, lim = o.limit ?? 520;
-  let [x, z] = o.start ?? [-420, 130], head = o.heading ?? -0.25;
-  const pts = [[x, z]];
-  for (let i = 1; i < n; i++) {
-    head += (rnd() - 0.5) * (o.turn ?? 0.7);
-    if (Math.hypot(x, z) > lim) head += 0.5 * Math.sin(Math.atan2(-z, -x) - head);   // 出界则轻轻拐回中心
-    x += Math.cos(head) * step; z += Math.sin(head) * step; pts.push([x, z]);
+// ═════════════════════════════ 程序化呼吸 / 微动 / 眨眼 ═════════════════════════════
+/**
+ * 非移动状态下的自然起伏：spine1→spine2→chest→head 依次带相位滞后的正弦旋转（吸气时脊柱微后仰、胸廓扩张、肩略抬），
+ * 头部周期性随机轻转（临界阻尼平滑），眨眼（偶有连眨）与眼球微扫视。确定性：同 seed 同序列。
+ * update(dt, still) 返回复用的 pose 对象：骨骼名 → [rx,ry,rz]（弧度），另有 chestScale、blink(0 睁..1 闭)、eyeX/eyeY(-1..1)。
+ */
+class IdleAnimator {
+  constructor(seed = 1, o = {}) {
+    this.rnd = mulberry32((seed >>> 0) || 1); this.o = { breathHz: 0.22, headYaw: 0.17, ...o };
+    this.t = 0; this.ph = this.rnd() * TAU; this.w = 1;
+    this.head = { ty: 0, tp: 0, y: 0, p: 0, sy: { v: 0 }, sp: { v: 0 }, next: 0.8 + this.rnd() * 1.5 };
+    this.blink = { next: 1.2 + this.rnd() * 3, t: -1, again: false };
+    this.eye = { tx: 0, ty: 0, x: 0, y: 0, next: 0.6 };
+    this.pose = { spine1: [0, 0, 0], spine2: [0, 0, 0], chest: [0, 0, 0], head: [0, 0, 0], clavL: [0, 0, 0], clavR: [0, 0, 0], chestScale: 0, blink: 0, eyeX: 0, eyeY: 0, weight: 1 };
   }
-  return pts;
+  update(dt, still = true) {
+    dt = safeDt(dt, 0.1); this.t += dt; this.w += ((still ? 1 : 0) - this.w) * expo(5, dt);
+    const w = this.w, bw = 0.4 + 0.6 * w, o = this.o, P = this.pose;
+    this.ph += TAU * o.breathHz * (1 + 0.08 * Math.sin(0.13 * this.t)) * dt;
+    const b = (lag) => Math.sin(this.ph - lag) + 0.18 * Math.sin(2 * (this.ph - lag) + 0.6);          // 吸气略快于呼气
+    P.spine1[0] = -0.006 * b(0) * bw; P.spine2[0] = -0.009 * b(0.35) * bw; P.chest[0] = -0.012 * b(0.7) * bw;
+    P.clavL[2] = 0.012 * b(0.7) * bw; P.clavR[2] = -0.012 * b(0.7) * bw; P.chestScale = 0.006 * b(0.7) * bw;
+    // 头部：周期性随机轻转 + 缓慢微摆
+    const H = this.head; H.next -= dt;
+    if (H.next <= 0) { H.ty = clamp((this.rnd() - 0.5) * 2 * o.headYaw * (0.4 + 0.6 * this.rnd()), -0.22, 0.22); H.tp = (this.rnd() - 0.5) * 0.07; H.next = 2.2 + this.rnd() * 3.8; }
+    H.y = smoothDamp(H.y, H.ty, H.sy, 0.32, dt); H.p = smoothDamp(H.p, H.tp, H.sp, 0.4, dt);
+    const sway = 0.012 * Math.sin(0.55 * this.t) * w;
+    P.head[1] = H.y * w + sway; P.head[0] = H.p * w - 0.008 * b(1.0) * bw; P.head[2] = 0.006 * Math.sin(0.37 * this.t + 1) * w;
+    // 眨眼
+    const K = this.blink; K.next -= dt;
+    if (K.t < 0 && K.next <= 0) { K.t = 0; K.again = this.rnd() < 0.18; }
+    let closure = 0;
+    if (K.t >= 0) { K.t += dt; const u = K.t / 0.15; if (u >= 1) { K.t = -1; K.next = K.again ? 0.12 : 2.4 + this.rnd() * 4; K.again = false; } else closure = Math.pow(Math.sin(Math.PI * u), 1.5); }
+    P.blink = closure;
+    // 视线聚焦：眼球微扫视
+    const E = this.eye; E.next -= dt;
+    if (E.next <= 0) { E.tx = (this.rnd() - 0.5) * 2; E.ty = (this.rnd() - 0.5) * 1.2; E.next = 0.6 + this.rnd() * 1.8; }
+    E.x += (E.tx - E.x) * expo(14, dt); E.y += (E.ty - E.y) * expo(14, dt); P.eyeX = E.x; P.eyeY = E.y; P.weight = w;
+    return P;
+  }
 }
 
-function splineSamples(pts, step = 0.5) {
-  const P = [pts[0], ...pts, pts[pts.length - 1]], dense = [];
-  for (let i = 1; i < P.length - 2; i++) {
-    const [p0, p1, p2, p3] = [P[i - 1], P[i], P[i + 1], P[i + 2]], m = Math.max(8, Math.ceil(Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / 0.1));
-    for (let j = 0; j < m; j++) {
-      const t = j / m, t2 = t * t, t3 = t2 * t;
-      dense.push([0, 1].map((k) => 0.5 * (2 * p1[k] + (-p0[k] + p2[k]) * t + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2 + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3)));
+// ═════════════════════════════ 白龙马步态 ═════════════════════════════
+const WALK_OFF = [0.0, 0.25, 0.5, 0.75];   // [后左, 前左, 后右, 前右]：侧序四拍 LH→LF→RH→RF
+const TROT_OFF = [0.5, 0.0, 0.0, 0.5];     // 对角小跑：LF+RH 同相，RF+LH 同相
+/**
+ * 四蹄步态：相位连续积分（变速不跳变），走(侧序四拍)↔小跑(对角)按速度平滑混合；每条腿 髋摆(+前) 与 膝折(负=小腿后折)。
+ * out = { legs:[{hip,knee}×4], bob, pitch(绕本地Z,+抬头), roll(绕本地X), phase, blend, amp }
+ */
+class GaitModel {
+  constructor() { this.phase = 0; this.blend = 0; this.amp = 0; this.out = { legs: [0, 1, 2, 3].map(() => ({ hip: 0, knee: 0 })), bob: 0, pitch: 0, roll: 0, phase: 0, blend: 0, amp: 0 }; }
+  step(dt, speed, moving) {
+    dt = safeDt(dt, 0.1); speed = Number.isFinite(speed) ? Math.max(0, speed) : 0;
+    const ampT = moving ? clamp(0.4 + speed / 9, 0.4, 1) : 0, blendT = moving ? smoothstep(7, 11, speed) : 0;
+    this.amp += (ampT - this.amp) * expo(moving ? 6 : 9, dt); this.blend += (blendT - this.blend) * expo(3, dt);
+    this.phase = (this.phase + clamp(0.8 + 0.085 * speed, 0.8, 2.3) * dt * (moving || this.amp > 0.02 ? 1 : 0)) % 1;
+    const o = this.out, bl = this.blend, am = this.amp, beta = lerp(0.62, 0.45, bl), A = lerp(0.30, 0.42, bl) * am;
+    for (let i = 0; i < 4; i++) {
+      const s = (this.phase + lerp(WALK_OFF[i], TROT_OFF[i], bl) + 4) % 1, L = o.legs[i], front = i === 1 || i === 3;
+      if (s < beta) { const u = s / beta; L.hip = A * Math.cos(Math.PI * u); L.knee = -0.08 * am * Math.sin(Math.PI * u); }
+      else { const v = (s - beta) / (1 - beta); L.hip = -A * Math.cos(Math.PI * v); L.knee = -(front ? 1.0 : 0.85) * am * Math.pow(Math.sin(Math.PI * v), 1.3); }
+    }
+    o.bob = lerp(0.035, 0.075, bl) * am * Math.sin(4 * Math.PI * this.phase + 0.6);
+    o.pitch = lerp(0.018, 0.024, bl) * am * Math.sin(4 * Math.PI * this.phase + 1.2);
+    o.roll = 0.014 * (1 - 0.6 * bl) * am * Math.sin(TAU * this.phase + Math.PI / 3);
+    o.phase = this.phase; o.blend = bl; o.amp = am;
+    return o;
+  }
+}
+
+// ═════════════════════════════ 骑手鞍座阻尼跟随 ═════════════════════════════
+/**
+ * 骑手随马鞍起伏的二阶阻尼：y'' = -2ζω·y' - ω²·y - a_anchor（锚点加速度作为扰动），位移与俯仰都夹紧在小范围内，
+ * 既有"软座"的滞后感，又保证臀部始终贴在鞍上（不穿模、不悬空）。返回 { dy, dpitch }（相对锚点的修正量）。
+ */
+class SaddleFollow {
+  constructor(o = {}) { this.w = o.omega ?? 15; this.z = o.zeta ?? 0.9; this.maxY = o.maxY ?? 0.05; this.maxP = o.maxPitch ?? 0.06; this.reset(); this.out = { dy: 0, dpitch: 0 }; }
+  reset() { this.y = 0; this.vy = 0; this.p = 0; this.vp = 0; this.pa = null; this.pp = null; this.lvy = 0; this.lvp = 0; this.fy = 0; this.fp = 0; }
+  step(dt, anchorY, anchorPitch) {
+    dt = Number.isFinite(dt) ? clamp(dt, 1e-4, 0.05) : 1 / 60;
+    if (this.pa === null) { this.pa = anchorY; this.pp = anchorPitch; }
+    const vy = (anchorY - this.pa) / dt, vp = (anchorPitch - this.pp) / dt;
+    this.fy += ((vy - this.lvy) / dt - this.fy) * 0.5; this.fp += ((vp - this.lvp) / dt - this.fp) * 0.5;      // 低通后的加速度
+    this.pa = anchorY; this.pp = anchorPitch; this.lvy = vy; this.lvp = vp;
+    const w = this.w, c = 2 * this.z * w;
+    this.vy += (-c * this.vy - w * w * this.y - this.fy) * dt; this.y += this.vy * dt;
+    this.vp += (-c * this.vp - w * w * this.p - this.fp) * dt; this.p += this.vp * dt;
+    if (this.y > this.maxY) { this.y = this.maxY; this.vy = Math.min(0, this.vy); } else if (this.y < -this.maxY) { this.y = -this.maxY; this.vy = Math.max(0, this.vy); }
+    if (this.p > this.maxP) { this.p = this.maxP; this.vp = Math.min(0, this.vp); } else if (this.p < -this.maxP) { this.p = -this.maxP; this.vp = Math.max(0, this.vp); }
+    this.out.dy = this.y; this.out.dpitch = this.p;
+    return this.out;
+  }
+}
+
+// ═════════════════════════════ 风场 ═════════════════════════════
+/** 世界风（沿 WIND_DIR 的阵风 + 缓慢变化 + 微弱上下扰动），返回 [x,y,z]（世界单位/秒） */
+function windAt(t, x = 0, z = 0, strength = 6, out = [0, 0, 0]) {
+  const s = Math.max(0, strength * (0.65 + 0.25 * Math.sin(0.5 * t + 0.013 * x) + 0.12 * Math.sin(1.7 * t + 0.021 * z + 1.3)));
+  out[0] = WIND_DIR[0] * s; out[1] = 0.08 * s * Math.sin(2.3 * t + 0.02 * (x + z)); out[2] = WIND_DIR[1] * s;
+  return out;
+}
+
+// ═════════════════════════════ Verlet / PBD 布料毛发仿真器 ═════════════════════════════
+function invertAffine(M, out = new Float64Array(16)) {
+  const a = M[0], b = M[4], c = M[8], d = M[1], e = M[5], f = M[9], g = M[2], h = M[6], i = M[10];
+  const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g, det = a * A + b * B + c * C;
+  const id = Math.abs(det) > 1e-18 ? 1 / det : 0;
+  const m00 = A * id, m10 = B * id, m20 = C * id, m01 = -(b * i - c * h) * id, m11 = (a * i - c * g) * id, m21 = -(a * h - b * g) * id, m02 = (b * f - c * e) * id, m12 = -(a * f - c * d) * id, m22 = (a * e - b * d) * id;
+  out[0] = m00; out[1] = m10; out[2] = m20; out[3] = 0; out[4] = m01; out[5] = m11; out[6] = m21; out[7] = 0; out[8] = m02; out[9] = m12; out[10] = m22; out[11] = 0;
+  out[12] = -(m00 * M[12] + m01 * M[13] + m02 * M[14]); out[13] = -(m10 * M[12] + m11 * M[13] + m12 * M[14]); out[14] = -(m20 * M[12] + m21 * M[13] + m22 * M[14]); out[15] = 1;
+  return out;
+}
+/** 各类布料的推荐参数（世界单位按游戏：1 单位≈0.6 m，重力取 16） */
+const CLOTH_PRESETS = {
+  cape: { gravity: 16, damping: 0.990, drag: 1.2, wind: 3.2, iterations: 3, bend: 0.30, pinK: 0.5 },
+  tails: { gravity: 16, damping: 0.990, drag: 1.0, wind: 4.0, iterations: 3, bend: 0.20, pinK: 0.5 },
+  drape: { gravity: 16, damping: 0.985, drag: 1.4, wind: 1.8, iterations: 3, bend: 0.40, pinK: 0.5 },     // 袈裟下摆
+  hair: { gravity: 16, damping: 0.965, drag: 1.6, windFull: true, wind: 0.7, iterations: 4, bend: 0.50, pinK: 0.4 },
+};
+/**
+ * 通用网格布料：把任意三角网格按位置焊接成粒子，边 → 距离约束（含对顶点弯曲/剪切约束），
+ * pin(0..1) 为"跟随骨骼/锚点"的程度（1=固定，0=自由，中间值=软固定，越靠近根部越硬）。
+ * 在世界空间做位置 Verlet（角色移动/转向的惯性自然产生），再转回网格局部空间写入。小步长(2 个子步×3 次迭代)比大步长多迭代更硬。
+ * o = { pin: Float32Array(每顶点), gravity, damping, drag, wind, windFull, iterations, bend, pinK, teleport, maxStep, hMax, maxSub, dtMax }
+ */
+class Cloth {
+  constructor(positions, indices, o = {}) {
+    const nv = positions.length / 3, map = new Map(), vp = new Int32Array(nv), rest = [];
+    for (let i = 0; i < nv; i++) {
+      const key = Math.round(positions[3 * i] * 1e4) + ',' + Math.round(positions[3 * i + 1] * 1e4) + ',' + Math.round(positions[3 * i + 2] * 1e4);
+      let id = map.get(key);
+      if (id === undefined) { id = rest.length / 3; map.set(key, id); rest.push(positions[3 * i], positions[3 * i + 1], positions[3 * i + 2]); }
+      vp[i] = id;
+    }
+    const P = rest.length / 3, R = Float32Array.from(rest);
+    this.P = P; this.vp = vp; this.rest = R; this.indices = indices;
+    const seen = new Set(), ea = [], eb = [], ek = [], opp = new Map();
+    const addEdge = (a, b, k) => { if (a === b) return; const lo = a < b ? a : b, hi = a < b ? b : a, key = lo * P + hi; if (seen.has(key)) return; seen.add(key); ea.push(lo); eb.push(hi); ek.push(k); };
+    for (let t = 0; t < indices.length; t += 3) {
+      const a = vp[indices[t]], b = vp[indices[t + 1]], c = vp[indices[t + 2]];
+      if (a === b || b === c || a === c) continue;
+      addEdge(a, b, 1); addEdge(b, c, 1); addEdge(c, a, 1);
+      for (const [u, v, w] of [[a, b, c], [b, c, a], [c, a, b]]) {
+        const key = (u < v ? u : v) * P + (u < v ? v : u), prev = opp.get(key);
+        if (prev === undefined) opp.set(key, w); else if (prev !== w) addEdge(prev, w, o.bend ?? 0.3);
+      }
+    }
+    this.ea = Int32Array.from(ea); this.eb = Int32Array.from(eb); this.ek = Float32Array.from(ek);
+    this.el = new Float32Array(ea.length);
+    for (let e = 0; e < ea.length; e++) this.el[e] = Math.hypot(R[3 * ea[e]] - R[3 * eb[e]], R[3 * ea[e] + 1] - R[3 * eb[e] + 1], R[3 * ea[e] + 2] - R[3 * eb[e] + 2]);
+    this.pin = new Float32Array(P);
+    if (o.pin) for (let i = 0; i < nv; i++) this.pin[vp[i]] = Math.max(this.pin[vp[i]], clamp(o.pin[i], 0, 1));
+    // 粒子静止法线（用于风的受力方向）
+    this.nrm0 = new Float32Array(3 * P);
+    for (let t = 0; t < indices.length; t += 3) {
+      const a = vp[indices[t]], b = vp[indices[t + 1]], c = vp[indices[t + 2]];
+      const ux = R[3 * b] - R[3 * a], uy = R[3 * b + 1] - R[3 * a + 1], uz = R[3 * b + 2] - R[3 * a + 2], vx = R[3 * c] - R[3 * a], vy = R[3 * c + 1] - R[3 * a + 1], vz = R[3 * c + 2] - R[3 * a + 2];
+      const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      for (const q of [a, b, c]) { this.nrm0[3 * q] += nx; this.nrm0[3 * q + 1] += ny; this.nrm0[3 * q + 2] += nz; }
+    }
+    for (let p = 0; p < P; p++) { const l = Math.hypot(this.nrm0[3 * p], this.nrm0[3 * p + 1], this.nrm0[3 * p + 2]) || 1; this.nrm0[3 * p] /= l; this.nrm0[3 * p + 1] /= l; this.nrm0[3 * p + 2] /= l; }
+    this.x = new Float32Array(3 * P); this.px = new Float32Array(3 * P); this.anchor = new Float32Array(3 * P); this.pn = new Float32Array(3 * P);
+    this.params = { gravity: 16, damping: 0.99, drag: 0.6, wind: 3, windFull: false, iterations: 3, pinK: 0.5, teleport: 3, maxStep: 0.4, hMax: 1 / 120, maxSub: 4, dtMax: 1 / 20, friction: 0.2, ...o };
+    this.ready = false; this.time = 0;
+  }
+  reset() { this.ready = false; }
+  /**
+   * dt 秒；M = 网格局部→世界矩阵(列主序)；wind = 世界风向量；colliders = 局部空间胶囊 [{a:[x,y,z], b:[x,y,z], r}]。
+   * 返回 false 表示本次未仿真（dt≤0/NaN 或矩阵退化）。
+   */
+  step(dt, M, wind = [0, 0, 0], colliders = null) {
+    if (!(dt > 0) || !Number.isFinite(dt)) return false;
+    dt = Math.min(dt, this.params.dtMax);
+    const sx = h3(M[0], M[1], M[2]); if (!(sx > 1e-6)) return false;
+    const P = this.P, R = this.rest, X = this.x, PX = this.px, A = this.anchor, pr = this.params;
+    let jump = 0;
+    for (let p = 0; p < P; p++) {
+      const rx = R[3 * p], ry = R[3 * p + 1], rz = R[3 * p + 2];
+      const ax = M[0] * rx + M[4] * ry + M[8] * rz + M[12], ay = M[1] * rx + M[5] * ry + M[9] * rz + M[13], az = M[2] * rx + M[6] * ry + M[10] * rz + M[14];
+      if (this.ready && this.pin[p] > 0.99) { const d = h3(ax - A[3 * p], ay - A[3 * p + 1], az - A[3 * p + 2]); if (d > jump) jump = d; }
+      A[3 * p] = ax; A[3 * p + 1] = ay; A[3 * p + 2] = az;
+    }
+    if (!this.ready || jump > pr.teleport * sx) { X.set(A); PX.set(A); this.ready = true; return true; }   // 首帧/传送：直接贴回静止形状
+    const n = Math.min(pr.maxSub, Math.max(1, Math.ceil(dt / pr.hMax))), h = dt / n;
+    const cw = [];
+    if (colliders) for (const c of colliders) cw.push({ a: this._tp(M, c.a), b: this._tp(M, c.b), r: c.r * sx });
+    const r0 = [M[0] / sx, M[1] / sx, M[2] / sx, M[4] / sx, M[5] / sx, M[6] / sx, M[8] / sx, M[9] / sx, M[10] / sx];   // 旋转部分（均匀缩放假设）
+    for (let s = 0; s < n; s++) { this.time += h; this._sub(h, sx, r0, wind, cw); }
+    return true;
+  }
+  _tp(M, v) { return [M[0] * v[0] + M[4] * v[1] + M[8] * v[2] + M[12], M[1] * v[0] + M[5] * v[1] + M[9] * v[2] + M[13], M[2] * v[0] + M[6] * v[1] + M[10] * v[2] + M[14]]; }
+  _sub(h, sx, r0, wind, cw) {
+    const P = this.P, X = this.x, PX = this.px, A = this.anchor, pr = this.params, pin = this.pin, nrm = this.nrm0;
+    const damp = Math.pow(pr.damping, h * 60), maxStep = pr.maxStep * sx, g = pr.gravity, pkF = 1 - Math.pow(1 - pr.pinK, h * 60);   // 小步长：每子步的软固定强度按步长换算
+    for (let p = 0; p < P; p++) {
+      const i = 3 * p;
+      if (pin[p] >= 0.999) { X[i] = A[i]; X[i + 1] = A[i + 1]; X[i + 2] = A[i + 2]; PX[i] = X[i]; PX[i + 1] = X[i + 1]; PX[i + 2] = X[i + 2]; continue; }
+      const vx = (X[i] - PX[i]) / h, vy = (X[i + 1] - PX[i + 1]) / h, vz = (X[i + 2] - PX[i + 2]) / h;
+      // 风：布片取相对风速在法线方向的分量(双面)；windFull(发丝)各向同性被吹向下风
+      const nx = r0[0] * nrm[i] + r0[3] * nrm[i + 1] + r0[6] * nrm[i + 2], ny = r0[1] * nrm[i] + r0[4] * nrm[i + 1] + r0[7] * nrm[i + 2], nz = r0[2] * nrm[i] + r0[5] * nrm[i + 1] + r0[8] * nrm[i + 2];
+      const gust = 0.8 + 0.2 * Math.sin(this.time * 2.3 + p * 0.61), rel = ((wind[0] - vx) * nx + (wind[1] - vy) * ny + (wind[2] - vz) * nz) * pr.wind * gust, wg = pr.wind * gust;
+      // drag：对静止空气的线性阻力，抑制钟摆式长时间摆动
+      const ax = (pr.windFull ? wg * wind[0] : rel * nx) - pr.drag * vx, ay = -g + (pr.windFull ? wg * wind[1] : rel * ny) - pr.drag * vy, az = (pr.windFull ? wg * wind[2] : rel * nz) - pr.drag * vz;
+      let dx = (X[i] - PX[i]) * damp + ax * h * h, dy = (X[i + 1] - PX[i + 1]) * damp + ay * h * h, dz = (X[i + 2] - PX[i + 2]) * damp + az * h * h;
+      const dl = h3(dx, dy, dz); if (dl > maxStep) { const k = maxStep / dl; dx *= k; dy *= k; dz *= k; }
+      PX[i] = X[i]; PX[i + 1] = X[i + 1]; PX[i + 2] = X[i + 2]; X[i] += dx; X[i + 1] += dy; X[i + 2] += dz;
+      if (pin[p] > 0) { const k = pin[p] * pkF; X[i] += (A[i] - X[i]) * k; X[i + 1] += (A[i + 1] - X[i + 1]) * k; X[i + 2] += (A[i + 2] - X[i + 2]) * k; }
+    }
+    const ea = this.ea, eb = this.eb, el = this.el, ek = this.ek, E = ea.length;
+    for (let it = 0; it < pr.iterations; it++) {
+      for (let e = 0; e < E; e++) {
+        const a = 3 * ea[e], b = 3 * eb[e], dx = X[b] - X[a], dy = X[b + 1] - X[a + 1], dz = X[b + 2] - X[a + 2], len = h3(dx, dy, dz);
+        if (len < 1e-9) continue;
+        const wa = 1 - clamp(pin[ea[e]], 0, 1), wb = 1 - clamp(pin[eb[e]], 0, 1), ws = wa + wb; if (ws <= 1e-6) continue;
+        const c = ((len - el[e] * sx) / len) * ek[e] / ws;
+        X[a] += dx * c * wa; X[a + 1] += dy * c * wa; X[a + 2] += dz * c * wa; X[b] -= dx * c * wb; X[b + 1] -= dy * c * wb; X[b + 2] -= dz * c * wb;
+      }
+    }
+    for (const c of cw) {
+      const abx = c.b[0] - c.a[0], aby = c.b[1] - c.a[1], abz = c.b[2] - c.a[2], l2 = abx * abx + aby * aby + abz * abz || 1e-12;
+      for (let p = 0; p < P; p++) {
+        if (pin[p] >= 0.999) continue;
+        const i = 3 * p, t = clamp(((X[i] - c.a[0]) * abx + (X[i + 1] - c.a[1]) * aby + (X[i + 2] - c.a[2]) * abz) / l2, 0, 1);
+        const qx = c.a[0] + abx * t, qy = c.a[1] + aby * t, qz = c.a[2] + abz * t, dx = X[i] - qx, dy = X[i + 1] - qy, dz = X[i + 2] - qz, d = h3(dx, dy, dz);
+        if (d < c.r) {
+          const k = d > 1e-9 ? c.r / d : 0, ox = d > 1e-9 ? qx + dx * k : qx, oy = d > 1e-9 ? qy + dy * k : qy + c.r, oz = d > 1e-9 ? qz + dz * k : qz;
+          X[i] = ox; X[i + 1] = oy; X[i + 2] = oz;
+          PX[i] += (X[i] - PX[i]) * pr.friction; PX[i + 1] += (X[i + 1] - PX[i + 1]) * pr.friction; PX[i + 2] += (X[i + 2] - PX[i + 2]) * pr.friction;   // 擦碰损失速度
+        }
+      }
     }
   }
-  dense.push(P[P.length - 2]);
-  const out = [dense[0]]; let acc = 0, next = step;
-  for (let i = 1; i < dense.length; i++) {
-    const d = Math.hypot(dense[i][0] - dense[i - 1][0], dense[i][1] - dense[i - 1][1]);
-    while (acc + d >= next) { const t = (next - acc) / d; out.push([lerp(dense[i - 1][0], dense[i][0], t), lerp(dense[i - 1][1], dense[i][1], t)]); next += step; }
-    acc += d;
+  /** 把仿真结果写回网格局部空间。Minv = invertAffine(M)。可同时重算（焊接后）法线 */
+  writeLocal(Minv, out, normalsOut = null) {
+    const X = this.x, vp = this.vp, nv = vp.length;
+    for (let i = 0; i < nv; i++) {
+      const p = 3 * vp[i], wx = X[p], wy = X[p + 1], wz = X[p + 2];
+      out[3 * i] = Minv[0] * wx + Minv[4] * wy + Minv[8] * wz + Minv[12]; out[3 * i + 1] = Minv[1] * wx + Minv[5] * wy + Minv[9] * wz + Minv[13]; out[3 * i + 2] = Minv[2] * wx + Minv[6] * wy + Minv[10] * wz + Minv[14];
+    }
+    if (!normalsOut) return;
+    const pn = this.pn, I = this.indices; pn.fill(0);
+    for (let t = 0; t < I.length; t += 3) {
+      const a = 3 * I[t], b = 3 * I[t + 1], c = 3 * I[t + 2], ux = out[b] - out[a], uy = out[b + 1] - out[a + 1], uz = out[b + 2] - out[a + 2], vx = out[c] - out[a], vy = out[c + 1] - out[a + 1], vz = out[c + 2] - out[a + 2];
+      const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      for (const q of [I[t], I[t + 1], I[t + 2]]) { const k = 3 * vp[q]; pn[k] += nx; pn[k + 1] += ny; pn[k + 2] += nz; }
+    }
+    for (let i = 0; i < nv; i++) { const k = 3 * vp[i], l = Math.hypot(pn[k], pn[k + 1], pn[k + 2]) || 1; normalsOut[3 * i] = pn[k] / l; normalsOut[3 * i + 1] = pn[k + 1] / l; normalsOut[3 * i + 2] = pn[k + 2] / l; }
+  }
+  /** 当前最大边伸长率（测试/调参用；sx = 当前缩放） */
+  maxStrain(sx = 1) {
+    let m = 0; const X = this.x;
+    for (let e = 0; e < this.ea.length; e++) { if (this.ek[e] < 1) continue; const a = 3 * this.ea[e], b = 3 * this.eb[e], l = Math.hypot(X[b] - X[a], X[b + 1] - X[a + 1], X[b + 2] - X[a + 2]); m = Math.max(m, Math.abs(l / (this.el[e] * sx) - 1)); }
+    return m;
+  }
+}
+
+// ───── xiyou-fx.js ─────
+// xiyou-fx.js — 重走西游 · 光影 / 环境 / 后期（THREE 由调用方注入；纯数学部分可在 Node 里测试）
+// 内容：色温、昼夜调色板(黎明/正午/黄昏/夜晚平滑过渡)、程序化噪点法线贴图数据、地形高度混合、画质自适应、阴影贴图对齐；
+//       指数高度雾(改写 fog_* ShaderChunk，带太阳方向暖色散射)、天空穹顶、PMREM 环境、地形混合材质、后期管线(Bloom/SSAO/ACES)。
+// 所有 GLSL 补丁都带"出错即回滚"：renderer.debug.onShaderError 触发后恢复内置着色器并关闭相关特效，游戏照常运行。
+const mix3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+
+// ═════════════════════════════ 色温 / 昼夜调色板 ═════════════════════════════
+/** 开尔文 → 线性 RGB（最大分量归一到 1；Tanner Helland 近似，1000–12000 K） */
+function kelvinToRGB(K) {
+  const t = clamp(K, 1000, 12000) / 100;
+  const r = t <= 66 ? 255 : 329.698727446 * Math.pow(t - 60, -0.1332047592), g = t <= 66 ? 99.4708025861 * Math.log(t) - 161.1195681661 : 288.1221695283 * Math.pow(t - 60, -0.0755148492);
+  const b = t >= 66 ? 255 : t <= 19 ? 0 : 138.5177312231 * Math.log(t - 10) - 305.0447927307;
+  const c = [r, g, b].map((v) => Math.pow(clamp(v, 0, 255) / 255, 2.2)), m = Math.max(...c, 1e-6);
+  return c.map((v) => v / m);
+}
+/** 与游戏原 updateDayNight 同一条太阳轨迹：sun = (cos a·500, sin a·500+150, 220)，a = dayTime·2π */
+function sunDirAt(dayTime) {
+  const a = dayTime * TAU;
+  return { dir: v3.norm([Math.cos(a) * 500, Math.sin(a) * 500 + 150, 220]), rising: Math.cos(a) > 0, a };
+}
+// 关键帧按太阳高度角(度)插值。字段：K(太阳色温) I(日光强度) hs/hg(半球天/地色，线性) hi(半球强度) fog(地平线雾色) zen(天顶) warm(暖散射强度) exp(曝光系数) bloom
+const KEYS = [
+  { e: -18, K: 1800, I: 0.00, hs: [0.020, 0.030, 0.085], hg: [0.010, 0.012, 0.020], hi: 0.55, fog: [0.016, 0.026, 0.070], zen: [0.002, 0.004, 0.018], warm: 0.00, exp: 1.45, bloom: 0.75 },
+  { e: -8, K: 1800, I: 0.00, hs: [0.040, 0.052, 0.140], hg: [0.016, 0.018, 0.030], hi: 0.62, fog: [0.040, 0.050, 0.110], zen: [0.006, 0.012, 0.050], warm: 0.10, exp: 1.35, bloom: 0.65 },
+  { e: -2, K: 2200, I: 0.30, hs: [0.200, 0.140, 0.190], hg: [0.060, 0.045, 0.050], hi: 0.85, fog: [0.560, 0.250, 0.150], zen: [0.030, 0.060, 0.220], warm: 1.00, exp: 1.22, bloom: 0.55 },
+  { e: 4, K: 2900, I: 0.95, hs: [0.480, 0.400, 0.420], hg: [0.130, 0.110, 0.090], hi: 1.15, fog: [0.640, 0.470, 0.330], zen: [0.060, 0.150, 0.430], warm: 0.95, exp: 1.14, bloom: 0.50 },
+  { e: 12, K: 3900, I: 1.90, hs: [0.620, 0.660, 0.760], hg: [0.200, 0.200, 0.160], hi: 1.55, fog: [0.610, 0.640, 0.650], zen: [0.080, 0.230, 0.610], warm: 0.65, exp: 1.06, bloom: 0.42 },
+  { e: 28, K: 5400, I: 2.70, hs: [0.700, 0.780, 0.940], hg: [0.240, 0.270, 0.210], hi: 1.95, fog: [0.560, 0.690, 0.820], zen: [0.090, 0.280, 0.760], warm: 0.28, exp: 1.00, bloom: 0.36 },
+  { e: 60, K: 6500, I: 3.20, hs: [0.730, 0.820, 1.000], hg: [0.260, 0.300, 0.240], hi: 2.10, fog: [0.540, 0.700, 0.860], zen: [0.100, 0.320, 0.850], warm: 0.18, exp: 0.96, bloom: 0.34 },
+];
+function keyAt(e) {
+  if (e <= KEYS[0].e) return KEYS[0];
+  for (let i = 0; i < KEYS.length - 1; i++) {
+    const a = KEYS[i], b = KEYS[i + 1];
+    if (e <= b.e) {
+      const t = smoothstep(a.e, b.e, e), L = (x, y) => x + (y - x) * t, L3 = (x, y) => mix3(x, y, t);
+      return { e, K: L(a.K, b.K), I: L(a.I, b.I), hs: L3(a.hs, b.hs), hg: L3(a.hg, b.hg), hi: L(a.hi, b.hi), fog: L3(a.fog, b.fog), zen: L3(a.zen, b.zen), warm: L(a.warm, b.warm), exp: L(a.exp, b.exp), bloom: L(a.bloom, b.bloom) };
+    }
+  }
+  return KEYS[KEYS.length - 1];
+}
+/**
+ * 一天中任意时刻的大气状态（全部线性色）。夜晚自动切换为月光（同一盏方向光），日出/日落的色温与暖雾强度不同。
+ * 返回 { lightDir, lightColor, lightIntensity, isMoon, sunDir, sunElev, hemiSky, hemiGround, hemiIntensity, fogColor, zenith, warmColor, warmAmt, exposure, bloom, stars }
+ */
+function atmosphereAt(dayTime) {
+  const { dir, rising, a } = sunDirAt(dayTime), elev = (Math.asin(clamp(dir[1], -1, 1)) * 180) / Math.PI, k = keyAt(elev);
+  const evening = smoothstep(0.2, -0.2, Math.cos(a));                                   // 0 清晨 … 1 黄昏
+  const sunCol = kelvinToRGB(k.K - 350 * evening), sunK = smoothstep(-5, 1, elev), moonK = smoothstep(2, -9, elev), isMoon = elev < -5;
+  const warm = mix3(mix3([1.0, 0.78, 0.45], [1.0, 0.62, 0.40], evening), [0.55, 0.65, 1.0], moonK);
+  const moonDir = v3.norm([-dir[0], Math.abs(dir[1]) * 0.8 + 0.25, -dir[2]]);
+  // 太阳强度在 −5° 降到 0，之后才换成月光（月光强度从 0 起渐入）：方向切换发生在光强为 0 时，阴影不跳变
+  const lightDir = isMoon ? moonDir : v3.norm([dir[0], Math.max(dir[1], 0.03), dir[2]]);
+  return {
+    sunDir: dir, sunElev: elev, rising,
+    lightDir, isMoon, lightColor: isMoon ? [0.55, 0.68, 1.0] : sunCol,
+    lightIntensity: isMoon ? 0.42 * smoothstep(-5, -12, elev) : k.I * sunK,
+    hemiSky: k.hs, hemiGround: k.hg, hemiIntensity: k.hi, fogColor: k.fog, zenith: k.zen, warmColor: warm, warmAmt: k.warm * (1 - 0.7 * moonK),
+    exposure: k.exp, bloom: k.bloom, stars: smoothstep(-3, -14, elev),
+  };
+}
+
+// ═════════════════════════════ 程序化噪点法线贴图（可无缝平铺） ═════════════════════════════
+function hash2(x, y, seed) { let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(seed | 0, 2147483647)) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+/** x 周期 perX、y 周期 perY 的平铺值噪声（两个周期可不同 → 各向异性拉伸） */
+function tileNoise(x, y, perX, perY, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi, u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy), mx = (n) => ((n % perX) + perX) % perX, my = (n) => ((n % perY) + perY) % perY;
+  const a = hash2(mx(xi), my(yi), seed), b = hash2(mx(xi + 1), my(yi), seed), c = hash2(mx(xi), my(yi + 1), seed), d = hash2(mx(xi + 1), my(yi + 1), seed);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+/**
+ * size×size 的 RGBA8 切线空间法线贴图（可无缝平铺）。约定：U(x) 沿网格圆周方向，V(y) 沿网格长度方向（发丝/经线沿 V 走）。
+ * 生成顺序：① 在各向异性(沿某一轴拉伸)的平铺噪声/正弦图案上得到高度场，取有限差分得原始 X/Y 扰动；
+ *          ② Z = sqrt(1 - X² - Y²)（先把 |XY| 限在 0.92 内，保证单位长）；③ 映射到 [0,255]；
+ *          ④ 所有噪声坐标都对各轴周期取模 → 边缘无缝平铺。
+ * kind：'pore' 皮肤毛孔(各向同性) / 'fur' 毛发(沿 V 略拉伸) / 'strand' 发丝(沿 V 强拉伸：横向细密、纵向舒缓) / 'weave' 织物(经线沿 V 更密更强，纬线起伏更缓)。
+ * strength = 整张图的 RMS 倾斜倍数(缺省 1，按 kind 有各自基准)；X/Y 共用同一个缩放，因此方向性(X、Y 方差之比)得以保留。
+ */
+function makeNormalMapData(size = 128, { kind = 'pore', seed = 1, strength = null } = {}) {
+  const CFG = { pore: { f: [8, 8], oct: 3, rms: 0.30 }, fur: { f: [22, 8], oct: 3, rms: 0.40 }, strand: { f: [28, 3], oct: 2, rms: 0.42 }, weave: { f: [0, 0], oct: 0, rms: 0.32 } };
+  const c = CFG[kind] ?? CFG.pore, H = new Float32Array(size * size);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const u = x / size, v = y / size; let h = 0;
+    if (kind === 'weave') {
+      const warp = 0.5 + 0.5 * Math.sin(u * TAU * 16 + 0.8 * Math.sin(v * TAU * 5)), weft = 0.5 + 0.5 * Math.sin(v * TAU * 7);   // 经线：横向 16 根，沿 V 微微起伏；纬线：沿 V 7 道（频率留在 Nyquist 以内，避免混叠）
+      h = 0.55 * warp * (0.65 + 0.35 * weft) + 0.25 * weft * (1 - 0.5 * warp) + 0.12 * (tileNoise(u * 24, v * 4, 24, 4, seed) - 0.5);                // 沿 V 拉伸的纤维噪声
+    } else {
+      let amp = 1, tot = 0;
+      for (let o = 0; o < c.oct; o++) { const px = c.f[0] << o, py = c.f[1] << o; h += amp * tileNoise(u * px, v * py, px, py, seed + o * 17); tot += amp; amp *= 0.5; }     // x、y 采样频率不同 = 沿低频轴拉伸
+      h = h / tot - 0.5;
+    }
+    H[y * size + x] = h;
+  }
+  const w = (i) => ((i % size) + size) % size, GX = new Float32Array(size * size), GY = new Float32Array(size * size);
+  let e2 = 0;
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {                                    // ① 原始 X/Y 扰动（周期回绕的中心差分）
+    const gx = -(H[y * size + w(x + 1)] - H[y * size + w(x - 1)]) * 0.5, gy = -(H[w(y + 1) * size + x] - H[w(y - 1) * size + x]) * 0.5;
+    GX[y * size + x] = gx; GY[y * size + x] = gy; e2 += gx * gx + gy * gy;
+  }
+  const k = ((strength ?? 1) * c.rms) / Math.sqrt(e2 / (size * size) + 1e-12), out = new Uint8ClampedArray(size * size * 4);
+  for (let i = 0; i < size * size; i++) {
+    let X = GX[i] * k, Y = GY[i] * k; const m = Math.hypot(X, Y); if (m > 0.92) { X *= 0.92 / m; Y *= 0.92 / m; }
+    const Z = Math.sqrt(Math.max(0, 1 - X * X - Y * Y));                                              // ② 保证单位长
+    out[4 * i] = Math.round((X * 0.5 + 0.5) * 255); out[4 * i + 1] = Math.round((Y * 0.5 + 0.5) * 255); out[4 * i + 2] = Math.round((Z * 0.5 + 0.5) * 255); out[4 * i + 3] = 255;   // ③ 映射到 [0,255]
   }
   return out;
 }
 
+// ═════════════════════════════ 地形：平滑高度混合 ═════════════════════════════
 /**
- * 地面：纯函数、种子确定。
- * opts = { seed, roads:[[x,z]...][] | null, hub:[x,z],
- *          swell:16 (大尺度起伏振幅 m), undul:3.0 / hummock:0.30 (中/小尺度起伏振幅 m，调小=更平缓), swellFreq:0.0035 / swellOct:4 (大起伏的基频与倍频数，基频调低=更宽缓), rim:{start,end,amp,square} (边缘山脊；square=按方形边界), boundAmp:6 (软边界抬升，0=关), pad:{inner:7,outer:16} (丘顶平台半径/过渡带外沿),
- *          palette:{lush,dry,dirt,rock} (线性反照率覆盖), dryBias:0 (<0 更绿) }
- * 返回 heightAt / normalAt / roadInfo / splatAt / colorAt / groundInfoAt / cavityAt / attachRocks
+ * 层权重 w(和为1) + 每层噪声 n(0..1) → 平滑混合后的权重。与地形着色器里的 GLSL 完全同一算法：
+ * 高度混合 h_i = w_i + amp·(n_i-0.5)，最大值附近 width 宽度内按比例过渡 → 交界处是"有机"的锯齿渐变，没有多边形硬边。
  */
-function makeGround(opts = {}) {
-  const seed = opts.seed ?? 1, hub = opts.hub ?? [0, 0], nz = makeNoise(seed);
-  const swellAmp = opts.swell ?? 16, swellFreq = opts.swellFreq ?? 0.0035, swellOct = opts.swellOct ?? 4, undulAmp = opts.undul ?? 3.0, humAmp = opts.hummock ?? 0.30, rimO = { start: 320, end: 900, amp: 70, square: false, ...(opts.rim ?? {}) }, boundAmp = opts.boundAmp ?? 6, padO = { inner: 7, outer: 16, ...(opts.pad ?? {}) }, dryBias = opts.dryBias ?? 0, pal = { ...PALETTE, ...(opts.palette ?? {}) };
-  const Ln = (x, z, oct, ox = 0, oz = 0) => nz.fbm2(x + ox, z + oz, oct);
-  const H0 = (x, z) => {
-    const r = Math.hypot(x - hub[0], z - hub[1]);
-    let H = swellAmp * Ln(x * swellFreq, z * swellFreq, swellOct) + undulAmp * Ln(x * 0.014, z * 0.014, 3, 31.7, -17.3) + humAmp * Ln(x * 0.07, z * 0.07, 2, -53.1, 11.9) + 4.2 * Math.exp(-((r / 40) ** 2));
-    const rr = rimO.square ? Math.max(Math.abs(x - hub[0]), Math.abs(z - hub[1])) : r, rs = rimO.amp > 0 ? smoothstep(rimO.start, rimO.end, rr) : 0;
-    if (rs > 0) {
-      let rim = nz.ridged2(x * 0.004 + 7.7, z * 0.004 - 3.1, 5) * rimO.amp * rs;
-      const cap = 0.7 * (110 + 40 * Ln(x * 0.002, z * 0.002, 1)) * (rimO.amp / 70);
-      if (rim > cap) rim = cap + (rim - cap) * 0.35;
-      H += rim;
-    }
-    return H;
-  };
-  const Hc = H0(hub[0], hub[1]);
-  const Hpre = (x, z) => {                                   // 丘顶压平 + 边界抬升（无路）
-    const r = Math.hypot(x - hub[0], z - hub[1]), c = smoothstep(padO.outer, padO.inner, r);
-    let h = H0(x, z);
-    if (c > 0) h = lerp(h, Hc + 0.03 * Ln(x * 0.5, z * 0.5, 1), c);
-    // BIBLE 把"边界抬升"写在修路之后；因 lerp(a+b, g+b, w) = lerp(a, g, w) + b，把它并入 Hpre 结果等价，且让路面 LUT(grade) 与最终路面一致
-    return boundAmp > 0 && r > 170 ? h + boundAmp * smoothstep(170, 240, r) * (0.6 + 0.4 * Ln(x * 0.01, z * 0.01, 1)) : h;
-  };
-  // ── 道路 LUT：0.5 m 采样 (x,z,s,grade)，grade 为沿线高度经 12 m 箱式滤波
-  const roadsPts = opts.roads === null ? [] : (opts.roads ?? [DEFAULT_ROAD]);
-  const roads = roadsPts.map((pts) => {
-    if (!Array.isArray(pts) || pts.length < 2 || pts.some((q) => !(Number.isFinite(q[0]) && Number.isFinite(q[1])))) throw new RangeError('道路需要 ≥2 个有限的 [x,z] 控制点');
-    const sm = splineSamples(pts, 0.5), n = sm.length, X = new Float32Array(n), Z = new Float32Array(n), S = new Float32Array(n), h = new Float64Array(n + 1);
-    for (let i = 0; i < n; i++) { X[i] = sm[i][0]; Z[i] = sm[i][1]; S[i] = i * 0.5; h[i + 1] = h[i] + Hpre(X[i], Z[i]); }
-    const G = new Float32Array(n);
-    for (let i = 0; i < n; i++) { const lo = Math.max(0, i - 12), hi = Math.min(n - 1, i + 12); G[i] = (h[hi + 1] - h[lo]) / (hi - lo + 1); }
-    return { x: X, z: Z, s: S, g: G, n, length: (n - 1) * 0.5 };
-  });
-  const CELL = 6, grid = new Map(), key = (cx, cz) => (cx + 4096) * 8192 + (cz + 4096);
-  let bx0 = Infinity, bx1 = -Infinity, bz0 = Infinity, bz1 = -Infinity;
-  roads.forEach((rd, ri) => {
-    for (let i = 0; i < rd.n; i++) {
-      const k = key(Math.floor(rd.x[i] / CELL), Math.floor(rd.z[i] / CELL));
-      let l = grid.get(k); if (!l) grid.set(k, (l = [])); l.push(ri * 65536 + i);
-      bx0 = Math.min(bx0, rd.x[i]); bx1 = Math.max(bx1, rd.x[i]); bz0 = Math.min(bz0, rd.z[i]); bz1 = Math.max(bz1, rd.z[i]);
-    }
-  });
-  const scratch = { d: Infinity, g: 0, s: 0, road: -1 };
-  /** 到最近道路的距离 d、该处路面高度 g、弧长 s（out 缺省复用同一个对象，调用方须立即取值） */
-  function roadInfo(x, z, out = scratch) {
-    out.d = Infinity; out.g = 0; out.s = 0; out.road = -1;
-    if (!roads.length || x < bx0 - CELL || x > bx1 + CELL || z < bz0 - CELL || z > bz1 + CELL) return out;
-    const cx = Math.floor(x / CELL), cz = Math.floor(z / CELL);
-    let best = Infinity, bi = -1, br = -1;
-    for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) {
-      const l = grid.get(key(cx + a, cz + b)); if (!l) continue;
-      for (const code of l) { const r = code >> 16, i = code & 65535, dx = x - roads[r].x[i], dz = z - roads[r].z[i], d2 = dx * dx + dz * dz; if (d2 < best) { best = d2; bi = i; br = r; } }
-    }
-    if (br < 0) return out;
-    const rd = roads[br]; let bd = Math.sqrt(best), bt = bi;
-    for (const j of [bi - 1, bi]) {                         // 精确到线段
-      if (j < 0 || j + 1 >= rd.n) continue;
-      const ax = rd.x[j], az = rd.z[j], ex = rd.x[j + 1] - ax, ez = rd.z[j + 1] - az, t = clamp(((x - ax) * ex + (z - az) * ez) / (ex * ex + ez * ez), 0, 1), d = Math.hypot(x - ax - ex * t, z - az - ez * t);
-      if (d < bd) { bd = d; bt = j + t; }
-    }
-    const i0 = Math.floor(bt), i1 = Math.min(rd.n - 1, i0 + 1), f = bt - i0;
-    out.d = bd; out.g = lerp(rd.g[i0], rd.g[i1], f); out.s = bt * 0.5; out.road = br;
-    return out;
-  }
-  function heightAt(x, z) {
-    let H = Hpre(x, z);
-    const ri = roadInfo(x, z);
-    if (ri.d < 4.5) H = lerp(H, ri.g, smoothstep(4.5, 1.6, ri.d) * 0.85) - 0.07 * smoothstep(1.3, 0.4, Math.abs(ri.d - 0.65));
-    return H;
-  }
-  function normalAt(x, z, out = [0, 1, 0]) {
-    const e = 0.3, hx = (heightAt(x + e, z) - heightAt(x - e, z)) / (2 * e), hz = (heightAt(x, z + e) - heightAt(x, z - e)) / (2 * e), l = Math.hypot(hx, 1, hz);
-    out[0] = -hx / l; out[1] = 1 / l; out[2] = -hz / l;
-    return out;
-  }
-  const cavityAt = (x, z, h = heightAt(x, z)) => {
-    const a = (heightAt(x + 3.5, z) + heightAt(x - 3.5, z) + heightAt(x, z + 3.5) + heightAt(x, z - 3.5)) / 4, b = (heightAt(x + 11, z) + heightAt(x - 11, z) + heightAt(x, z + 11) + heightAt(x, z - 11)) / 4;
-    return clamp((a - h) * 0.2 + (b - h) * 0.035, 0, 0.55);
-  };
-  let colliders = [];
-  /** §4.3 着色权重 [lush, dry, rock, dirt]（和为 1） */
-  function splatAt(x, z, n = normalAt(x, z), cav = 0) {
-    const r = Math.hypot(x - hub[0], z - hub[1]), O = nz.simplex2(x * 0.06, z * 0.06), Lm = Ln(x * 0.017, z * 0.017, 3);
-    let dB = Infinity; for (const c of colliders) dB = Math.min(dB, Math.hypot(x - c.x, z - c.z) - c.r);
-    let R = Math.max(smoothstep(0.26 + 0.08 * O, 0.45, 1 - n[1]), smoothstep(0.4, -0.4, dB));
-    let D = Math.max(smoothstep(3.4, 1.4, roadInfo(x, z).d), smoothstep(1.6, 0.6, dB) * 0.8, smoothstep(18, 8, r) * 0.35 * (0.5 + 0.5 * Lm));
-    let Y = clamp(0.55 + 0.9 * Ln(x * 0.012, z * 0.012, 3) + 0.25 * (n[0] * -SUN_DIR[0] + n[2] * -SUN_DIR[2]) - 0.6 * cav + dryBias, 0, 1);
-    D *= 1 - R; Y *= (1 - R) * (1 - D);
-    const lush = (1 - R) * (1 - D) * (1 - Y), s = lush + Y + R + D;
-    return [lush / s, Y / s, R / s, D / s];
-  }
-  function colorAt(x, z, n = normalAt(x, z), cav = 0) {
-    const w = splatAt(x, z, n, cav), v = 1 + 0.12 * Ln(x * 0.3, z * 0.3, 2), c = [0, 0, 0];
-    [pal.lush, pal.dry, pal.rock, pal.dirt].forEach((p, i) => { for (let k = 0; k < 3; k++) c[k] += w[i] * p[k]; });
-    return [c[0] * v, c[1] * v, c[2] * v];
-  }
-  /** §4.3 tGround：草密度 / 高度系数 / 湿润度 / 洼地 AO */
-  function groundInfoAt(x, z) {
-    const n = normalAt(x, z), cav = cavityAt(x, z), w = splatAt(x, z, n, cav), r = Math.hypot(x - hub[0], z - hub[1]), pad = smoothstep(18, 8, r);
-    const density = (1 - w[2]) * (1 - smoothstep(0.3, 0.7, w[3])) * (0.55 + 0.45 * Ln(x * 0.05, z * 0.05, 1));
-    const moisture = clamp(cav * 1.6 + 0.3 * Ln(x * 0.01, z * 0.01, 1) - w[1] * 0.5, 0, 1);
-    const hf = 0.35 + 0.65 * smoothstep(-0.2, 0.6, Ln(x * 0.02, z * 0.02, 2) + moisture * 0.4) * (1 - 0.7 * pad);
-    return { density: clamp(density, 0, 1), heightFactor: hf, moisture, ao: 1 - cav };
-  }
-  return { seed, hub, Hc, roads, heightAt, normalAt, roadInfo, splatAt, colorAt, groundInfoAt, cavityAt, attachRocks(c) { colliders = c; } };
+function heightBlend(w, n, { amp = 0.34, width = 0.24 } = {}) {
+  const h = w.map((v, i) => Math.max(v, 0) + amp * (n[i] - 0.5)), m = Math.max(...h), b = h.map((v) => clamp((v - (m - width)) / width, 0, 1)), s = b.reduce((x, y) => x + y, 0) || 1;
+  return b.map((v) => v / s);
 }
 
-// ═════════════════════════════ 地形网格（§4.2） ═════════════════════════════
-/** 可分离网格轴：|x|≤inner 内均匀 step（427 列），之外按 growth 几何增长到 ±outer */
-function makeAxis({ inner = 160, step = 0.75, growth = 1.045, outer = 1500 } = {}) {
-  const n = Math.floor(inner / step), mid = [];
-  for (let i = -n; i <= n; i++) mid.push(i * step);
-  const right = []; let x = n * step, d = step;
-  while (x < outer) { d *= growth; x = Math.min(outer, x + d); right.push(x); }
-  return Float64Array.from([...right.slice().reverse().map((v) => -v), ...mid, ...right]);
-}
-/** 只采样高度（约 14 万次求值，亚秒级）：游戏用它做"与渲染网格严格一致"的 terrainHeight */
-function sampleHeights(ground, axis = makeAxis()) {
-  const nx = axis.length, H = new Float32Array(nx * nx);
-  for (let j = 0; j < nx; j++) for (let i = 0; i < nx; i++) H[j * nx + i] = ground.heightAt(axis[i], axis[j]);
-  return { axis, cols: nx, rows: nx, heights: H };
-}
-/** 顶点 = 解析高度(或 o.heights 复用)；法线 = 解析 normalAt（o.gridNormals=true 时改用栅格差分）；颜色 = 着色权重烘出的远景反照率；棋盘格对角线 */
-function buildTerrain(ground, o = {}) {
-  const ax = o.axis ?? makeAxis(o.axisOpts), nx = ax.length, nv = nx * nx;
-  const P = new Float32Array(nv * 3), N = new Float32Array(nv * 3), C = o.colors === false ? null : new Float32Array(nv * 3), tmp = [0, 1, 0];
-  for (let j = 0; j < nx; j++) {
-    for (let i = 0; i < nx; i++) {
-      const x = ax[i], z = ax[j], k = j * nx + i, y = o.heights ? o.heights[k] : ground.heightAt(x, z);
-      P[3 * k] = x; P[3 * k + 1] = y; P[3 * k + 2] = z;
-      if (o.gridNormals && o.heights) {                       // 与几何一致的栅格差分法线（不额外求值，约快 4 倍）
-        const H = o.heights, i0 = i > 0 ? i - 1 : i, i1 = i < nx - 1 ? i + 1 : i, j0 = j > 0 ? j - 1 : j, j1 = j < nx - 1 ? j + 1 : j;
-        const gx = (H[j * nx + i1] - H[j * nx + i0]) / (ax[i1] - ax[i0]), gz = (H[j1 * nx + i] - H[j0 * nx + i]) / (ax[j1] - ax[j0]), l = Math.hypot(gx, 1, gz);
-        tmp[0] = -gx / l; tmp[1] = 1 / l; tmp[2] = -gz / l;
-      } else ground.normalAt(x, z, tmp);
-      N[3 * k] = tmp[0]; N[3 * k + 1] = tmp[1]; N[3 * k + 2] = tmp[2];
-      if (C) { const c = ground.colorAt(x, z, tmp, Math.abs(x) < 200 && Math.abs(z) < 200 && o.cavity !== false ? ground.cavityAt(x, z, y) : 0); C[3 * k] = c[0]; C[3 * k + 1] = c[1]; C[3 * k + 2] = c[2]; }
-    }
-  }
-  const I = new Uint32Array(6 * (nx - 1) * (nx - 1));
-  let t = 0;
-  for (let j = 0; j < nx - 1; j++) {
-    for (let i = 0; i < nx - 1; i++) {
-      const a = j * nx + i, b = a + 1, d = a + nx, c = d + 1;
-      if ((i + j) & 1) { I[t++] = a; I[t++] = d; I[t++] = c; I[t++] = a; I[t++] = c; I[t++] = b; }
-      else { I[t++] = a; I[t++] = d; I[t++] = b; I[t++] = b; I[t++] = d; I[t++] = c; }
-    }
-  }
-  const m = { positions: P, normals: N, indices: I, axis: ax, cols: nx, rows: nx };
-  if (C) m.colors = C;
-  return m;
-}
-/** 在网格上按其真实三角划分取高度。m 可以是 buildTerrain 的结果，也可以是 sampleHeights 的结果；坐标越界时夹到边缘 */
-function terrainHeightFromMesh(m, x, z) {
-  const ax = m.axis, nx = m.cols, H = m.heights, P = m.positions, find = (v) => { let lo = 0, hi = ax.length - 1; while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (ax[mid] <= v) lo = mid; else hi = mid; } return lo; };
-  x = clamp(x, ax[0], ax[nx - 1]); z = clamp(z, ax[0], ax[nx - 1]);
-  const i = find(x), j = find(z), u = (x - ax[i]) / (ax[i + 1] - ax[i]), v = (z - ax[j]) / (ax[j + 1] - ax[j]), Y = H ? (ii, jj) => H[jj * nx + ii] : (ii, jj) => P[3 * (jj * nx + ii) + 1];
-  const ya = Y(i, j), yb = Y(i + 1, j), yd = Y(i, j + 1), yc = Y(i + 1, j + 1);
-  if ((i + j) & 1) return u >= v ? ya + u * (yb - ya) + v * (yc - yb) : ya + v * (yd - ya) + u * (yc - yd);   // 对角线 a–c
-  return u + v <= 1 ? ya + u * (yb - ya) + v * (yd - ya) : yc + (1 - u) * (yd - yc) + (1 - v) * (yb - yc);          // 对角线 b–d
-}
-
-// ═════════════════════════════ 岩石（§4.6） ═════════════════════════════
-/** 6 个原型：二十面体细分球 + 脊状 3D fBm·0.35 + 层理台阶噪声，底部压平，法线重算；hi / lo 两档 LOD 同形 */
-function makeRockPrototypes({ seed = 777, hi = 4, lo = 2 } = {}) {
-  return Array.from({ length: 6 }, (_, p) => {
-    const nz = makeNoise(seed + p * 13), rnd = mulberry32(seed + p * 31);
-    const asp = [1 + 0.25 * (rnd() - 0.5), 0.7 + 0.3 * rnd(), 1 + 0.25 * (rnd() - 0.5)], strata = 0.02 + 0.03 * rnd(), kk = 3.5 + 3 * rnd(), off = rnd() * 50;
-    const build = (level) => {
-      const m = icosphere(level), P = m.positions;
-      for (let i = 0; i < P.length; i += 3) {
-        const ux = P[i], uy = P[i + 1], uz = P[i + 2], t = uy * kk + 0.9 * nz.simplex3(ux * 1.3 + off, uy * 1.3, uz * 1.3);
-        const r = 1 + 0.35 * (nz.ridged3(ux * 1.7 + off, uy * 1.7, uz * 1.7, 4) - 0.45) + strata * (t - Math.floor(t) - 0.5);
-        let y = uy * r * asp[1]; const yf = -0.5 * asp[1];
-        if (y < yf) y = yf + (y - yf) * 0.12;                 // 压平底部
-        P[i] = ux * r * asp[0]; P[i + 1] = y; P[i + 2] = uz * r * asp[2];
-      }
-      return computeNormals(m);
-    };
-    const hiM = build(hi), loM = build(lo), b = bounds(hiM);
-    return { id: p, hi: hiM, lo: loM, asp, ymin: b.min[1], ymax: b.max[1], radius: Math.max(b.max[0], b.max[2], -b.min[0], -b.min[2]) };
-  });
-}
-/** 列主序 4×4：T · R(对齐法线, 绕法线偏航) · S */
-function composeMatrix(pos, yaw, sc, n = [0, 1, 0]) {
-  const f0 = [Math.sin(yaw), 0, Math.cos(yaw)], right = v3.norm(v3.cross(n, f0)), fwd = v3.cross(right, n), m = new Float32Array(16);
-  m.set([right[0] * sc[0], right[1] * sc[0], right[2] * sc[0], 0, n[0] * sc[1], n[1] * sc[1], n[2] * sc[1], 0, fwd[0] * sc[2], fwd[1] * sc[2], fwd[2] * sc[2], 0, pos[0], pos[1], pos[2], 1]);
-  return m;
-}
-/** 摆放（seed 777）：5–12 主石 + 每块 3–9 碎石(±2.2 m) + 2–3 立石(y×2.5) + 远处坡面露头；全部 normal.y≥0.72、下沉 25–50% */
-function placeRocks(ground, protos, { seed = 777 } = {}) {
-  const rnd = mulberry32(seed), inst = [], coll = [], hub = ground.hub;
-  const find = (gen, minRoad, tries = 60) => {
-    for (let t = 0; t < tries; t++) { const [x, z] = gen(), n = ground.normalAt(x, z); if (n[1] >= 0.72 && ground.roadInfo(x, z).d > minRoad) return { x, z, n }; }
+// ═════════════════════════════ 画质档位 / 自适应 ═════════════════════════════
+const QUALITY = {
+  high: { shadow: 4096, ssao: true, bloom: true, msaa: 4, env: true, post: true, atmosphere: true, cloth: true, pixelRatioMax: 1.8 },
+  medium: { shadow: 2048, ssao: false, bloom: true, msaa: 2, env: true, post: true, atmosphere: true, cloth: true, pixelRatioMax: 1.5 },
+  low: { shadow: 1024, ssao: false, bloom: false, msaa: 0, env: false, post: false, atmosphere: false, cloth: false, pixelRatioMax: 1.0 },
+};
+const TIERS = ['high', 'medium', 'low'];
+/** 帧时间自适应：EMA 超标持续一段时间则降一档；长时间余量充足则升一档；手动锁定后不再自动调整 */
+class QualityGovernor {
+  constructor(tier = 'high', o = {}) { this.tier = tier; this.locked = !!o.locked; this.o = { slowMs: 24, fastMs: 11, downFrames: 90, upFrames: 900, cooldown: 20, ...o }; this.ema = 16.7; this.slow = 0; this.fast = 0; this.t = 0; this.lastChange = -1e9; }
+  setTier(t, lock = true) { if (TIERS.includes(t)) { this.tier = t; this.locked = lock; this.slow = this.fast = 0; this.lastChange = this.t; } return this.tier; }
+  /** dtMs：本帧耗时(毫秒)。返回新档位名（有变化时），否则 null */
+  update(dtMs) {
+    if (!Number.isFinite(dtMs) || dtMs <= 0 || dtMs > 1000) return null;                     // 切后台/卡顿尖峰不计入
+    this.t += dtMs / 1000; this.ema += (dtMs - this.ema) * 0.05;
+    if (this.locked) return null;
+    const i = TIERS.indexOf(this.tier);
+    if (this.ema > this.o.slowMs) { this.slow++; this.fast = 0; } else if (this.ema < this.o.fastMs) { this.fast++; this.slow = 0; } else { this.slow = Math.max(0, this.slow - 1); this.fast = 0; }
+    if (this.slow >= this.o.downFrames && i < TIERS.length - 1) { this.tier = TIERS[i + 1]; this.slow = 0; this.lastChange = this.t; this.ema = 16.7; return this.tier; }
+    if (this.fast >= this.o.upFrames && i > 0 && this.t - this.lastChange > this.o.cooldown) { this.tier = TIERS[i - 1]; this.fast = 0; this.lastChange = this.t; this.ema = 16.7; return this.tier; }
     return null;
-  };
-  const add = (kind, proto, x, z, n, radius, ySquash, align) => {
-    const p = protos[proto], sc = [radius, radius * ySquash, radius * (0.8 + 0.4 * rnd())], sink = 0.25 + 0.25 * rnd(), g = ground.heightAt(x, z), hProto = (p.ymax - p.ymin) * sc[1];
-    const y = g - sink * hProto - p.ymin * sc[1], yaw = rnd() * TAU;
-    inst.push({ kind, proto, x, y, z, scale: sc, yaw, sink, groundY: g, normalY: n[1], matrix: composeMatrix([x, y, z], yaw, sc, align ? n : [0, 1, 0]) });
-    return radius;
-  };
-  const nHero = 5 + Math.floor(rnd() * 8);
-  for (let h = 0; h < nHero; h++) {
-    const edge = h < Math.ceil(nHero / 3), radius = 1.5 + rnd() * 2.5;
-    const spot = find(() => { const a = rnd() * TAU, r = edge ? 18 + rnd() * 22 : 40 + rnd() * 110; return [hub[0] + Math.cos(a) * r, hub[1] + Math.sin(a) * r]; }, radius + 3);
-    if (!spot) continue;
-    add('hero', Math.floor(rnd() * 6), spot.x, spot.z, spot.n, radius, 0.7 + 0.3 * rnd(), false);
-    coll.push({ x: spot.x, z: spot.z, r: radius * 0.9 });
-    const nd = 3 + Math.floor(rnd() * 7);
-    for (let d = 0; d < nd; d++) {
-      const s = find(() => [spot.x + (rnd() * 2 - 1) * 2.2, spot.z + (rnd() * 2 - 1) * 2.2], 1.5, 12);
-      if (s) add('debris', Math.floor(rnd() * 6), s.x, s.z, s.n, 0.15 + rnd() * 0.45, 0.6 + 0.4 * rnd(), false);
-    }
   }
-  const road = ground.roads[0], nStand = 2 + Math.floor(rnd() * 2);
-  for (let s = 0; road && s < nStand; s++) {
-    const spot = find(() => {
-      const i = Math.floor(rnd() * road.n), j = Math.min(road.n - 1, i + 1), tx = road.x[j] - road.x[i], tz = road.z[j] - road.z[i], l = Math.hypot(tx, tz) || 1, side = (rnd() < 0.5 ? -1 : 1) * (4 + rnd() * 4);
-      return [road.x[i] - (tz / l) * side, road.z[i] + (tx / l) * side];
-    }, 3, 80);
-    if (!spot) continue;
-    const radius = 0.5 + rnd() * 0.4;
-    add('standing', Math.floor(rnd() * 6), spot.x, spot.z, spot.n, radius, 2.5, false);
-    coll.push({ x: spot.x, z: spot.z, r: radius });
-  }
-  for (let t = 0, got = 0; t < 600 && got < 24; t++) {                                // 远处陡坡露头，对齐地面法线
-    const a = rnd() * TAU, r = 300 + rnd() * 400, x = hub[0] + Math.cos(a) * r, z = hub[1] + Math.sin(a) * r, n = ground.normalAt(x, z);
-    if (n[1] < 0.8) { add('outcrop', Math.floor(rnd() * 6), x, z, n, 3 + rnd() * 5, 0.6 + 0.3 * rnd(), true); got++; }
-  }
-  ground.attachRocks(coll);
-  return { instances: inst, colliders: coll };
+}
+/** 阴影相机跟随目标并对齐到光空间纹素网格（移动时阴影边缘不闪烁）。light = 单位方向(指向太阳)，返回对齐后的目标 [x,y,z] */
+function snapToTexel(target, lightDir, texel) {
+  const up = Math.abs(lightDir[1]) > 0.95 ? [1, 0, 0] : [0, 1, 0], r = v3.norm(v3.cross(up, lightDir)), u = v3.cross(lightDir, r);
+  const x = v3.dot(target, r), y = v3.dot(target, u), z = v3.dot(target, lightDir);
+  const sx = Math.round(x / texel) * texel, sy = Math.round(y / texel) * texel;
+  return [r[0] * sx + u[0] * sy + lightDir[0] * z, r[1] * sx + u[1] * sy + lightDir[1] * z, r[2] * sx + u[2] * sy + lightDir[2] * z];
 }
 
-// ═════════════════════════════ 远山环带（§3.2） ═════════════════════════════
-const MOUNTAIN_LAYERS = [
-  { radius: 1800, H: 160, base: -10, depth: 260, haze: 0.30 },
-  { radius: 2400, H: 320, base: -20, depth: 360, haze: 0.50 },
-  { radius: 3200, H: 520, base: -40, depth: 500, haze: 0.66, snow: true },
-  { radius: 4200, H: 780, base: -60, depth: 500, haze: 0.78 },
-];
-const wrapPI = (a) => a - TAU * Math.floor((a + Math.PI) / TAU);
-/** 4 层 360° 环带（各 481×11 顶点）；颜色已烘入 森林→岩石→雪 反照率、环境+日照、雾霾混合（公式见 BIBLE §3.2） */
-function buildMountainRings({ seed = 5, sunDir = SUN_DIR, fogColor = [0.50, 0.42, 0.33], layers = MOUNTAIN_LAYERS, cols = 480, rows = 10, bake = true, albedoScale = 1 } = {}) {
-  const nz = makeNoise(seed), thSun = Math.atan2(sunDir[0], sunDir[2]);
-  return layers.map((Ly, li) => {
-    const nC = cols + 1, nR = rows + 1, nv = nC * nR, P = new Float32Array(nv * 3), UV = new Float32Array(nv * 2), relH = new Float32Array(nv), fb = new Float32Array(nv);
-    for (let i = 0; i < nC; i++) {
-      const th = (TAU * i) / cols, cx = Math.cos(th) * 2.45, sx = Math.sin(th) * 2.45, d = Math.abs(wrapPI(th - thSun));
-      const notch = 1 - 0.55 * Math.exp(-((d / 0.2) ** 2)), az = 0.65 + 0.35 * smoothstep(0.3, 1.2, d);
-      for (let j = 0; j < nR; j++) {
-        const E = j / rows, k = i * nR + j, rid = nz.ridged3(cx + li * 13.1, sx - li * 7.7, E * 1.2 + li * 3.3, 6), f = nz.fbm3(cx * 1.3 + 5.5 + li, sx * 1.3 - 2.2, E * 1.1 + 9.9, 3);
-        const amp = (0.25 + 0.95 * rid * (0.55 + 0.45 * f)) * notch * az * Math.sin(Math.min(1, E * 2.2 + 0.05) * Math.PI / 2), R = Ly.radius + Ly.depth * E;
-        P[3 * k] = R * Math.sin(th); P[3 * k + 1] = Ly.base + Ly.H * amp; P[3 * k + 2] = R * Math.cos(th);
-        UV[2 * k] = i / cols; UV[2 * k + 1] = E; relH[k] = clamp(amp, 0, 1); fb[k] = f;
-      }
-    }
-    const I = new Uint32Array(6 * cols * rows); let t = 0;
-    for (let i = 0; i < cols; i++) for (let j = 0; j < rows; j++) { const a = i * nR + j, b = (i + 1) * nR + j, c = b + 1, d = a + 1; I[t++] = a; I[t++] = c; I[t++] = b; I[t++] = a; I[t++] = d; I[t++] = c; }
-    const m = computeNormals({ positions: P, uvs: UV, indices: I }), C = new Float32Array(nv * 3), N = m.normals, snow = new Uint8Array(nv);
-    for (let i = 0; i < nC; i++) {
-      const th = (TAU * i) / cols, anti = Math.abs(wrapPI(th - thSun - Math.PI)) < 0.873;
-      for (let j = 0; j < nR; j++) {
-        const k = i * nR + j, h = relH[k], ny = N[3 * k + 1], tt = smoothstep(0.1, 0.8, h);
-        let alb = [lerp(0.035, 0.09, tt), lerp(0.05, 0.085, tt), lerp(0.045, 0.08, tt)];
-        if (Ly.snow && anti && h > 0.62 + 0.1 * fb[k] && ny > 0.55) { alb = [0.8, 0.8, 0.82]; snow[k] = 1; } else if (albedoScale !== 1) alb = alb.map((v) => Math.min(1, v * albedoScale));
-        const ndl = Math.max(0, N[3 * k] * sunDir[0] + ny * sunDir[1] + N[3 * k + 2] * sunDir[2]), amb = [0.30, 0.38, 0.46], sun = [3.3, 3.3 * 0.74, 3.3 * 0.47];
-        const haze = Math.min(0.985, Ly.haze + (1 - Ly.haze) * (1 - smoothstep(0, 0.55, h)) * 0.65 + (1 - h) * 0.08);
-        if (!bake) { for (let c = 0; c < 3; c++) C[3 * k + c] = alb[c]; continue; }
-        for (let c = 0; c < 3; c++) {
-          const lit = alb[c] * (amb[c] * (0.55 + 0.45 * ny) + sun[c] * ndl * 0.55) + Math.pow(ndl, 3) * 0.02 * h;
-          C[3 * k + c] = lerp(lit, fogColor[c], haze);
-        }
-      }
-    }
-    m.colors = C; m.relH = relH; m.snow = snow; m.cols = nC; m.rows = nR; m.layer = li; m.haze = Ly.haze; m.radius = Ly.radius;
-    return m;
-  });
+// ═════════════════════════════ GLSL（保持保守写法，贴近 three r160 内置 chunk） ═════════════════════════════
+const GLSL = {
+  fogParsVertex: `#ifdef USE_FOG
+  varying float vFogDepth;
+  varying vec3 vXmFogPos;
+#endif`,
+  fogVertex: `#ifdef USE_FOG
+  vFogDepth = - mvPosition.z;
+  vXmFogPos = cameraPosition + transpose( mat3( viewMatrix ) ) * mvPosition.xyz;
+#endif`,
+  fogParsFragment: `#ifdef USE_FOG
+  uniform vec3 fogColor;
+  varying float vFogDepth;
+  varying vec3 vXmFogPos;
+  #ifdef FOG_EXP2
+    uniform float fogDensity;
+    uniform vec4 xmFogA;
+    uniform vec3 xmFogSun;
+    uniform vec3 xmFogWarm;
+  #else
+    uniform float fogNear;
+    uniform float fogFar;
+  #endif
+#endif`,
+  fogFragment: `#ifdef USE_FOG
+  #ifdef FOG_EXP2
+    vec3 xmV = vXmFogPos - cameraPosition;
+    float xmDist = length( xmV );
+    vec3 xmRd = xmV / max( xmDist, 0.0001 );
+    float xmB = max( xmFogA.x, 0.00001 );
+    float xmY0 = clamp( cameraPosition.y - xmFogA.y, -400.0, 4000.0 );
+    float xmK = xmB * xmRd.y;
+    float xmInt = abs( xmK ) > 0.0001 ? ( 1.0 - exp( - xmK * xmDist ) ) / xmK : xmDist;
+    float xmOpt = fogDensity * exp( - xmB * xmY0 ) * xmInt;
+    float xmFogF = clamp( 1.0 - exp( - max( xmOpt, 0.0 ) ), 0.0, 1.0 );
+    float xmSunT = pow( max( dot( xmRd, normalize( xmFogSun ) ), 0.0 ), xmFogA.w );
+    vec3 xmCol = mix( fogColor, xmFogWarm, clamp( xmSunT * xmFogA.z, 0.0, 1.0 ) );
+    gl_FragColor.rgb = mix( gl_FragColor.rgb, xmCol, xmFogF );
+  #else
+    float fogFactor = smoothstep( fogNear, fogFar, vFogDepth );
+    gl_FragColor.rgb = mix( gl_FragColor.rgb, fogColor, fogFactor );
+  #endif
+#endif`,
+  skyVertex: `varying vec3 vDir;
+void main() {
+  vDir = normalize( position );
+  vec4 p = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+  gl_Position = p.xyww;
+}`,
+  skyFragment: `uniform vec3 uZenith;
+uniform vec3 uHorizon;
+uniform vec3 uWarm;
+uniform vec3 uSunDir;
+uniform vec3 uSunColor;
+uniform float uWarmAmt;
+uniform float uWarmPow;
+uniform float uSunDisc;
+uniform float uStars;
+varying vec3 vDir;
+float xmHash( vec3 p ) {
+  p = fract( p * 0.3183099 + 0.1 );
+  p *= 17.0;
+  return fract( p.x * p.y * p.z * ( p.x + p.y + p.z ) );
+}
+void main() {
+  vec3 rd = normalize( vDir );
+  vec3 sd = normalize( uSunDir );
+  float s = max( dot( rd, sd ), 0.0 );
+  vec3 horizon = mix( uHorizon, uWarm, clamp( pow( s, uWarmPow ) * uWarmAmt, 0.0, 1.0 ) );
+  vec3 col = mix( horizon, uZenith, pow( clamp( rd.y, 0.0, 1.0 ), 0.5 ) );
+  col = mix( col, uHorizon, smoothstep( 0.02, -0.12, rd.y ) );
+  col += uSunColor * ( pow( s, 6.0 ) * 0.10 + pow( s, 500.0 ) * uSunDisc );
+  float st = step( 0.9965, xmHash( floor( rd * 220.0 ) ) ) * uStars * smoothstep( 0.05, 0.5, rd.y );
+  col += vec3( st );
+  gl_FragColor = vec4( col, 1.0 );
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`,
+  terrainVertDecl: `attribute vec4 splat;
+varying vec4 vSplat;
+varying vec3 vXmTerrainPos;`,
+  terrainVertMain: `vSplat = splat;
+vXmTerrainPos = ( modelMatrix * vec4( position, 1.0 ) ).xyz;`,
+  terrainFragDecl: `varying vec4 vSplat;
+varying vec3 vXmTerrainPos;
+uniform vec3 xmPalLush;
+uniform vec3 xmPalDry;
+uniform vec3 xmPalRock;
+uniform vec3 xmPalDirt;
+float xmTH( vec2 p ) { return fract( sin( dot( p, vec2( 127.1, 311.7 ) ) ) * 43758.5453 ); }
+float xmTN( vec2 p ) {
+  vec2 i = floor( p );
+  vec2 f = fract( p );
+  f = f * f * ( 3.0 - 2.0 * f );
+  return mix( mix( xmTH( i ), xmTH( i + vec2( 1.0, 0.0 ) ), f.x ), mix( xmTH( i + vec2( 0.0, 1.0 ) ), xmTH( i + vec2( 1.0, 1.0 ) ), f.x ), f.y );
+}
+float xmTF( vec2 p ) { return 0.5 * xmTN( p ) + 0.3 * xmTN( p * 2.1 + 7.3 ) + 0.2 * xmTN( p * 4.3 + 1.7 ); }`,
+  terrainFragMain: `vec2 xmP = vXmTerrainPos.xz;
+vec4 xmW = max( vSplat, vec4( 0.0 ) );
+vec4 xmNz = vec4( xmTF( xmP * 0.21 + 1.3 ), xmTF( xmP * 0.21 + 8.1 ), xmTF( xmP * 0.21 + 15.7 ), xmTF( xmP * 0.21 + 22.9 ) );
+vec4 xmHh = xmW + 0.34 * ( xmNz - 0.5 );
+float xmMx = max( max( xmHh.x, xmHh.y ), max( xmHh.z, xmHh.w ) );
+vec4 xmB = clamp( ( xmHh - ( xmMx - 0.24 ) ) / 0.24, 0.0, 1.0 );
+xmB = xmB / max( xmB.x + xmB.y + xmB.z + xmB.w, 0.0001 );
+vec3 xmAlb = xmB.x * xmPalLush + xmB.y * xmPalDry + xmB.z * xmPalRock + xmB.w * xmPalDirt;
+diffuseColor.rgb = xmAlb * ( 0.92 + 0.16 * xmTF( xmP * 1.9 ) );`,
+};
+
+// ═════════════════════════════ THREE 胶水 ═════════════════════════════
+/** 噪点法线贴图 → THREE.DataTexture（按 kind+tile 缓存） */
+function makeNormalTextureFactory(THREE) {
+  const cache = new Map();
+  return (spec) => {
+    const key = `${spec.kind}:${spec.tile?.join('x')}`;
+    if (cache.has(key)) return cache.get(key);
+    const size = 128, tex = new THREE.DataTexture(makeNormalMapData(size, { kind: spec.kind, seed: 7 + key.length }), size, size, THREE.RGBAFormat);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.repeat.set(spec.tile?.[0] ?? 8, spec.tile?.[1] ?? 8);
+    tex.magFilter = THREE.LinearFilter; tex.minFilter = THREE.LinearMipmapLinearFilter; tex.generateMipmaps = true; tex.anisotropy = 4;
+    if (THREE.NoColorSpace !== undefined) tex.colorSpace = THREE.NoColorSpace;
+    tex.needsUpdate = true; cache.set(key, tex);
+    return tex;
+  };
 }
 
-// ──────── xiyou-three.js ────────
+/** 指数高度雾：改写 fog_* ShaderChunk，并通过 Material.prototype.onBeforeCompile 注入共享 uniform。返回控制器 */
+function installHeightFog(THREE) {
+  const SC = THREE.ShaderChunk, saved = { fog_pars_vertex: SC.fog_pars_vertex, fog_vertex: SC.fog_vertex, fog_pars_fragment: SC.fog_pars_fragment, fog_fragment: SC.fog_fragment }, protoHook = THREE.Material.prototype.onBeforeCompile;
+  const U = { xmFogA: { value: new THREE.Vector4(0.004, 0, 0.7, 6) }, xmFogSun: { value: new THREE.Vector3(0.5, 0.8, 0.3) }, xmFogWarm: { value: new THREE.Color(1, 0.7, 0.4) } };
+  const hook = function (shader) { if (shader.fragmentShader && shader.fragmentShader.indexOf('xmFogA') >= 0) { shader.uniforms.xmFogA = U.xmFogA; shader.uniforms.xmFogSun = U.xmFogSun; shader.uniforms.xmFogWarm = U.xmFogWarm; } };
+  SC.fog_pars_vertex = GLSL.fogParsVertex; SC.fog_vertex = GLSL.fogVertex; SC.fog_pars_fragment = GLSL.fogParsFragment; SC.fog_fragment = GLSL.fogFragment;
+  THREE.Material.prototype.onBeforeCompile = hook;
+  return {
+    uniforms: U, active: true, hook,
+    /** heightFalloff：高度衰减系数(1/单位)；baseHeight：雾基准面高度；warmAmt/warmPow：太阳方向暖色散射强度/集中度 */
+    set({ heightFalloff = 0.004, baseHeight = 0, warmAmt = 0.7, warmPow = 6, sunDir = [0.5, 0.8, 0.3], warm = [1, 0.7, 0.4] } = {}) { U.xmFogA.value.set(heightFalloff, baseHeight, warmAmt, warmPow); U.xmFogSun.value.set(sunDir[0], sunDir[1], sunDir[2]); U.xmFogWarm.value.setRGB(warm[0], warm[1], warm[2]); },
+    restore() { if (!this.active) return; SC.fog_pars_vertex = saved.fog_pars_vertex; SC.fog_vertex = saved.fog_vertex; SC.fog_pars_fragment = saved.fog_pars_fragment; SC.fog_fragment = saved.fog_fragment; THREE.Material.prototype.onBeforeCompile = protoHook; this.active = false; },
+  };
+}
+
+/** 天空穹顶（BackSide，渲染到远平面，随相机移动）；uniforms 同时供 PMREM 环境使用 */
+function createSkyDome(THREE, { radius = 1000 } = {}) {
+  const U = { uZenith: { value: new THREE.Color(0.1, 0.3, 0.8) }, uHorizon: { value: new THREE.Color(0.6, 0.7, 0.8) }, uWarm: { value: new THREE.Color(1, 0.7, 0.4) }, uSunDir: { value: new THREE.Vector3(0.3, 0.8, 0.3) }, uSunColor: { value: new THREE.Color(1, 0.9, 0.7) }, uWarmAmt: { value: 0.7 }, uWarmPow: { value: 6 }, uSunDisc: { value: 6 }, uStars: { value: 0 } };
+  const mat = new THREE.ShaderMaterial({ uniforms: U, vertexShader: GLSL.skyVertex, fragmentShader: GLSL.skyFragment, side: THREE.BackSide, depthWrite: false, fog: false });
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 32, 16), mat); mesh.name = 'skyDome'; mesh.frustumCulled = false; mesh.renderOrder = -1000;
+  const set = (st) => { U.uZenith.value.setRGB(...st.zenith); U.uHorizon.value.setRGB(...st.fogColor); U.uWarm.value.setRGB(...st.warmColor); U.uSunDir.value.set(...st.sunDir); U.uSunColor.value.setRGB(...st.lightColor); U.uWarmAmt.value = st.warmAmt; U.uStars.value = st.stars; U.uSunDisc.value = st.sunElev > -2 ? 6 : 0; };
+  return { mesh, uniforms: U, set, material: mat };
+}
+
+/** PMREM 环境（角色金属/皮肤/布料的 IBL）。materials 在 register 时登记，refresh 后统一换 envMap。不改变场景整体光照 */
+function createEnvironment(THREE, renderer, sky) {
+  const pmrem = new THREE.PMREMGenerator(renderer), envScene = new THREE.Scene(), dome = new THREE.Mesh(new THREE.SphereGeometry(50, 32, 16), sky.material.clone());
+  dome.material.uniforms = sky.uniforms; dome.material.side = THREE.BackSide; envScene.add(dome);
+  const targets = new Set(); let rt = null;
+  return {
+    texture: null,
+    register(mat) { targets.add(mat); if (this.texture) mat.envMap = this.texture; },
+    refresh() {
+      const prev = rt; rt = pmrem.fromScene(envScene, 0.02); this.texture = rt.texture;
+      for (const m of targets) m.envMap = this.texture;
+      if (prev) prev.dispose();
+    },
+    dispose() { if (rt) rt.dispose(); pmrem.dispose(); targets.clear(); },
+  };
+}
+
+/** 地形混合材质：splat(vec4) 顶点属性 + 高度混合；失败可 revert() 回到顶点色 */
+function patchTerrainMaterial(THREE, material, palette) {
+  const U = { xmPalLush: { value: new THREE.Color().setRGB(...palette.lush) }, xmPalDry: { value: new THREE.Color().setRGB(...palette.dry) }, xmPalRock: { value: new THREE.Color().setRGB(...palette.rock) }, xmPalDirt: { value: new THREE.Color().setRGB(...palette.dirt) } };
+  const prev = material.onBeforeCompile;
+  material.onBeforeCompile = function (shader) {
+    Object.assign(shader.uniforms, U);
+    shader.vertexShader = shader.vertexShader.replace('#include <common>', '#include <common>\n' + GLSL.terrainVertDecl).replace('#include <begin_vertex>', '#include <begin_vertex>\n' + GLSL.terrainVertMain);
+    shader.fragmentShader = shader.fragmentShader.replace('#include <common>', '#include <common>\n' + GLSL.terrainFragDecl).replace('#include <color_fragment>', '#include <color_fragment>\n' + GLSL.terrainFragMain);
+    if (prev && prev !== THREE.Material.prototype.onBeforeCompile) prev.call(this, shader);
+    else if (THREE.Material.prototype.onBeforeCompile) THREE.Material.prototype.onBeforeCompile.call(this, shader);     // 链上全局雾 uniform 注入
+  };
+  material.customProgramCacheKey = () => 'xm-terrain-blend';
+  material.needsUpdate = true;
+  return { uniforms: U, revert() { material.onBeforeCompile = prev; material.customProgramCacheKey = () => ''; material.needsUpdate = true; } };
+}
+
+/**
+ * 后期管线：RenderPass →（SSAO）→ UnrealBloom → OutputPass（ACES + 输出色彩空间）。M = 动态 import 得到的模块
+ * { EffectComposer, RenderPass, UnrealBloomPass, SSAOPass, OutputPass }。MSAA 通过 HalfFloat 渲染目标的 samples 保留。
+ */
+function createPostPipeline(THREE, M, renderer, scene, camera, o = {}) {
+  const size = renderer.getSize(new THREE.Vector2()), pr = renderer.getPixelRatio();
+  const rt = new THREE.WebGLRenderTarget(size.x * pr, size.y * pr, { type: THREE.HalfFloatType, samples: renderer.capabilities.isWebGL2 ? (o.msaa ?? 4) : 0 });
+  const composer = new M.EffectComposer(renderer, rt); composer.setPixelRatio(pr); composer.setSize(size.x, size.y);
+  composer.addPass(new M.RenderPass(scene, camera));
+  let ssao = null;
+  if (o.ssao && M.SSAOPass) {
+    ssao = new M.SSAOPass(scene, camera, size.x, size.y);
+    const unit = 1 / Math.max(1, camera.far - camera.near);                      // SSAOPass 的距离阈值是"归一化线性深度"：按相机远近平面换算成世界单位
+    ssao.kernelRadius = o.aoRadius ?? 1.6; ssao.minDistance = 0.05 * unit; ssao.maxDistance = (o.aoRadius ?? 1.6) * 1.4 * unit; composer.addPass(ssao);
+  }
+  const bloom = new M.UnrealBloomPass(new THREE.Vector2(size.x, size.y), o.bloomStrength ?? 0.4, o.bloomRadius ?? 0.55, o.bloomThreshold ?? 2.6);
+  bloom.enabled = o.bloom !== false; composer.addPass(bloom);
+  composer.addPass(new M.OutputPass());
+  return {
+    composer, bloom, ssao, render(dt) { composer.render(dt); },
+    setSize(w, h) { composer.setPixelRatio(renderer.getPixelRatio()); composer.setSize(w, h); },
+    dispose() { composer.passes.forEach((p) => p.dispose && p.dispose()); rt.dispose(); },
+  };
+}
+
+// ───── xiyou-three.js ─────
 // xiyou-three.js — 把 xiyou-character / xiyou-world 产出的纯数据接到 THREE（建议 three ≥ r152）
 // THREE 由调用方注入，因此既可 `import * as THREE from 'three'`，也可用静态页里的全局 THREE：
 //   import { buildCharacterData } from './xiyou-character.js';
@@ -3735,14 +4422,26 @@ function toGeometry(THREE, m, { skinned = false } = {}) {
   return g;
 }
 
-/** 材质描述 → THREE 材质。opts.materialFactory(spec) 可返回自定义材质（例如你项目里的 patchMaterial）；返回空则走默认 */
+/**
+ * 材质描述(PBR 规格) → THREE 材质。opts.materialFactory(spec) 可整体接管；opts.normalMaps(spec.normalMap) 提供微法线贴图；
+ * opts.env 提供 register(material) 以接入 PMREM 环境反射。
+ * 分层：metal=MeshStandard(金属度0.92/粗糙0.22 + 环境反射)；cloth=MeshPhysical(sheen 微纤维光泽，暖金 sheenColor)；
+ *      skin/fur/hair=微法线扰动（hair/fur 带各向异性高光）；gloss(眼睛)=MeshPhysical(clearcoat)。
+ */
 function makeMaterial(THREE, spec, opts = {}) {
   if (opts.materialFactory) { const custom = opts.materialFactory(spec); if (custom) return custom; }
-  const physical = spec.kind === 'cloth' && spec.sheen > 0 && THREE.MeshPhysicalMaterial;
-  const Cls = physical || THREE.MeshStandardMaterial;
+  const physical = !!THREE.MeshPhysicalMaterial && (spec.sheen > 0 || spec.anisotropy > 0 || spec.clearcoat > 0);
+  const Cls = physical ? THREE.MeshPhysicalMaterial : THREE.MeshStandardMaterial;
   const mat = new Cls({ roughness: spec.roughness ?? 0.8, metalness: spec.metalness ?? 0, side: spec.side === 'double' ? THREE.DoubleSide : THREE.FrontSide, vertexColors: !!spec.vertexColors });
   mat.color.setRGB(spec.color[0], spec.color[1], spec.color[2]);
-  if (physical) { mat.sheen = spec.sheen; mat.sheenColor.setRGB(...spec.sheenColor); mat.sheenRoughness = 0.5; }
+  if (spec.envMapIntensity !== undefined) mat.envMapIntensity = spec.envMapIntensity;
+  if (physical) {
+    if (spec.sheen > 0) { mat.sheen = spec.sheen; mat.sheenColor.setRGB(...(spec.sheenColor ?? [1, 1, 1])); mat.sheenRoughness = spec.sheenRoughness ?? 0.5; }
+    if (spec.anisotropy > 0 && 'anisotropy' in mat) { mat.anisotropy = spec.anisotropy; mat.anisotropyRotation = spec.anisotropyRotation ?? 0; }
+    if (spec.clearcoat > 0) { mat.clearcoat = spec.clearcoat; mat.clearcoatRoughness = spec.clearcoatRoughness ?? 0.05; }
+  }
+  if (spec.normalMap && opts.normalMaps) { const tex = opts.normalMaps(spec.normalMap); if (tex) { mat.normalMap = tex; mat.normalScale.set(spec.normalMap.scale ?? 1, spec.normalMap.scale ?? 1); } }
+  if (opts.env && opts.env.register && (spec.envMapIntensity ?? 0) > 0) opts.env.register(mat);
   mat.name = spec.kind;
   return mat;
 }
@@ -3805,6 +4504,10 @@ function createStaticCharacter(THREE, baked, opts = {}) {
     group.add(mesh);
     return mesh;
   });
+  for (const d of baked.dynamic ?? []) {                      // 动态部件在静态模式下按静止形状显示
+    const mesh = new THREE.Mesh(toGeometry(THREE, d.mesh), makeMaterial(THREE, { ...d.material, color: [1, 1, 1], vertexColors: true }, opts));
+    mesh.name = d.name; mesh.castShadow = opts.castShadow ?? true; group.add(mesh); meshes.push(mesh);
+  }
   function dispose() { for (const m of meshes) { m.geometry.dispose(); m.material.dispose?.(); } }
   return { group, meshes, dispose, baked };
 }
@@ -3815,6 +4518,7 @@ function createTerrainMesh(THREE, terrain, opts = {}) {
   g.setAttribute('position', new THREE.BufferAttribute(terrain.positions, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(terrain.normals, 3));
   if (terrain.colors) g.setAttribute('color', new THREE.BufferAttribute(terrain.colors, 3));
+  if (terrain.splat) g.setAttribute('splat', new THREE.BufferAttribute(terrain.splat, 4));
   g.setIndex(new THREE.BufferAttribute(terrain.indices, 1));
   const mat = opts.material ?? new THREE.MeshStandardMaterial({ vertexColors: !!terrain.colors, roughness: 0.92, metalness: 0 });
   const mesh = new THREE.Mesh(g, mat);
@@ -3864,8 +4568,77 @@ function createWorldObjects(THREE, { terrain, protos, placement, rings }, opts =
   return out;
 }
 
-return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshBuilder, computeNormals, transformMesh, xf, mirrorX, filterTris, mergeMeshes, colorize, loft, lathe, ellipsoid, torus, icosphere, signedVolume, bounds, validateMesh, hashMesh, makeLayout, buildSkeleton, skinMesh, rigidMesh, torsoAt, legRadius, legPoint, armPath, armRadius, footMesh, headShape, mat, shell, CHARACTERS, buildCharacterData, eulerMat, RIDE_POSE, poseData, bakeCharacter, SUN_DIR, WIND_DIR, DEFAULT_ROAD, PALETTE, generateRoad, makeGround, makeAxis, sampleHeights, buildTerrain, terrainHeightFromMesh, makeRockPrototypes, composeMatrix, placeRocks, MOUNTAIN_LAYERS, buildMountainRings, toGeometry, makeMaterial, createCharacter, createStaticCharacter, createTerrainMesh, createRocks, createMountains, createWorldObjects };
+/**
+ * 蒙皮烘焙角色（bakeCharacter 的结果）：骨骼层级 + 每个 PBR 桶一个 SkinnedMesh(共用 Skeleton) + 动态部件(披风/飘带/袈裟/长发)各一个普通 Mesh（由 ClothRig 每帧改写顶点）。
+ * 返回 { group, bones, skeleton, boneByName, meshes, dynamic:[{mesh, part}], colliders, dispose }。
+ */
+function createSkinnedBaked(THREE, baked, opts = {}) {
+  const sk = baked.skeleton, group = new THREE.Group();
+  group.name = `character:${baked.kind}`;
+  const bones = sk.bones.map((b) => { const bone = new THREE.Bone(); bone.name = b.name; return bone; });
+  sk.bones.forEach((b, i) => {
+    const pp = b.parent >= 0 ? sk.bones[b.parent].pos : [0, 0, 0], r = [b.pos[0] - pp[0], b.pos[1] - pp[1], b.pos[2] - pp[2]];
+    bones[i].position.set(r[0], r[1], r[2]); bones[i].userData.rest = r;
+    if (b.parent >= 0) bones[b.parent].add(bones[i]);
+  });
+  group.add(bones[0]); group.updateMatrixWorld(true);
+  const skeleton = new THREE.Skeleton(bones), meshes = [], boneByName = (n) => bones[sk.index[n]];
+  for (const b of baked.buckets) {
+    const mesh = new THREE.SkinnedMesh(toGeometry(THREE, b.mesh, { skinned: true }), makeMaterial(THREE, { ...b.material, vertexColors: true }, opts));
+    mesh.name = b.name; mesh.frustumCulled = false; mesh.castShadow = opts.castShadow ?? true; mesh.receiveShadow = !!opts.receiveShadow;
+    group.add(mesh); mesh.bind(skeleton); meshes.push(mesh);
+  }
+  const dynamic = (baked.dynamic ?? []).map((d) => {
+    const geo = toGeometry(THREE, { ...d.mesh, positions: Float32Array.from(d.mesh.positions), normals: Float32Array.from(d.mesh.normals) });   // 拷贝：仿真会改写，不能污染缓存里的烘焙数据
+    if (THREE.DynamicDrawUsage !== undefined) { geo.attributes.position.setUsage?.(THREE.DynamicDrawUsage); geo.attributes.normal.setUsage?.(THREE.DynamicDrawUsage); }
+    const mesh = new THREE.Mesh(geo, makeMaterial(THREE, { ...d.material, color: [1, 1, 1], vertexColors: true }, opts));
+    mesh.name = d.name; mesh.frustumCulled = false; mesh.castShadow = opts.castShadow ?? true; group.add(mesh);
+    return { mesh, part: d };
+  });
+  function dispose() { for (const m of [...meshes, ...dynamic.map((d) => d.mesh)]) { m.geometry.dispose(); m.material.dispose?.(); } }
+  return { group, root: bones[0], bones, skeleton, boneByName, meshes, dynamic, colliders: baked.colliders, dispose, baked };
+}
+
+/** 把 IdleAnimator 的 pose 写到骨骼上（相对静止姿态的欧拉偏移；眨眼=眼骨沿 Y 压扁；视线=眼骨微位移；k=模型尺度） */
+function applyIdlePose(fig, pose, k = 1) {
+  const B = fig.boneByName;
+  for (const n of ['spine1', 'spine2', 'chest', 'head']) { const b = B(n); if (b) b.rotation.set(pose[n][0], pose[n][1], pose[n][2]); }
+  B('clavicle_L')?.rotation.set(0, 0, pose.clavL[2]); B('clavicle_R')?.rotation.set(0, 0, pose.clavR[2]);
+  B('chest')?.scale.set(1, 1 + pose.chestScale, 1 + pose.chestScale);
+  for (const n of ['eye_L', 'eye_R']) { const e = B(n); if (!e) continue; e.scale.y = Math.max(0.06, 1 - 0.94 * pose.blink); const r = e.userData.rest; e.position.set(r[0] + pose.eyeX * 0.0009 * k, r[1] + pose.eyeY * 0.0007 * k, r[2]); }
+}
+
+/**
+ * 布料装配：每个动态部件一个 Cloth（Verlet/PBD）。update(dt, wind) 在世界空间仿真并把结果写回网格局部空间。
+ * wind 为世界风向量；extraColliders（模型局部空间胶囊）可追加坐骑等碰撞体；离屏/过远可传 skip 跳过。
+ */
+class ClothRig {
+  constructor() { this.items = []; this.inv = new Float64Array(16); }
+  add(entry, { colliders = [], extraColliders = [], presets = CLOTH_PRESETS } = {}) {
+    const part = entry.part, kind = part.type === 'tails' ? 'tails' : part.type === 'hair' ? 'hair' : part.type === 'drape' ? 'drape' : 'cape';
+    const cloth = new Cloth(part.mesh.positions, part.mesh.indices, { pin: part.pin, ...presets[kind] });
+    this.items.push({ mesh: entry.mesh, cloth, colliders: [...colliders, ...extraColliders], type: part.type });
+    return cloth;
+  }
+  update(dt, wind, skip = false) {
+    if (skip) return;
+    for (const it of this.items) {
+      it.mesh.updateWorldMatrix(true, false);
+      const M = it.mesh.matrixWorld.elements;
+      if (it.cloth.step(dt, M, wind, it.colliders)) {
+        const a = it.mesh.geometry.attributes;
+        it.cloth.writeLocal(invertAffine(M, this.inv), a.position.array, a.normal.array);
+        a.position.needsUpdate = true; a.normal.needsUpdate = true;
+      }
+    }
+  }
+  reset() { for (const it of this.items) it.cloth.reset(); }
+}
+
+return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshBuilder, computeNormals, transformMesh, xf, mirrorX, filterTris, mergeMeshes, colorize, loft, lathe, ellipsoid, torus, icosphere, signedVolume, bounds, validateMesh, hashMesh, SUN_DIR, WIND_DIR, DEFAULT_ROAD, PALETTE, generateRoad, makeGround, makeAxis, sampleHeights, buildTerrain, terrainHeightFromMesh, makeRockPrototypes, composeMatrix, placeRocks, MOUNTAIN_LAYERS, buildMountainRings, makeLayout, buildSkeleton, skinMesh, rigidMesh, torsoAt, legRadius, legPoint, armPath, armRadius, footMesh, headShape, mat, shell, CHARACTERS, buildCharacterData, eulerMat, RIDE_POSE, poseData, PBR, bodyColliders, bakeCharacter, smoothDamp, IdleAnimator, GaitModel, SaddleFollow, windAt, invertAffine, CLOTH_PRESETS, Cloth, kelvinToRGB, sunDirAt, atmosphereAt, makeNormalMapData, heightBlend, QUALITY, TIERS, QualityGovernor, snapToTexel, GLSL, makeNormalTextureFactory, installHeightFog, createSkyDome, createEnvironment, patchTerrainMaterial, createPostPipeline, toGeometry, makeMaterial, createCharacter, createStaticCharacter, createTerrainMesh, createRocks, createMountains, createWorldObjects, createSkinnedBaked, applyIdlePose, ClothRig };
 })();
+    const XM_QS = typeof location !== "undefined" && location.search ? new URLSearchParams(location.search) : null;
+    const xmImport = (url) => import(url);
     const XM_CFG = {
         enabled: true,
         cell: 5,
@@ -3873,7 +4646,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         unit: 1.5,
         colorScale: 1.5,
         saddleTop: 2.205,
-        anchorY: 0.38,
+        anchor: [-0.10, 0.38, 0],
         figures: { tang: "tangseng", wukong: "wukong", bajie: "bajie", wujing: "wujing" },
         ground: {
             swell: 28,
@@ -3893,7 +4666,39 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         },
         mountains: { scale: 0.75, albedoScale: 3 }
     };
+    const XM_FX = {
+        enabled: true,
+        physics: true,
+        idle: true,
+        rideDynamics: true,
+        pbr: true,
+        windStrength: 6,
+        fogDensity: 0.00058,
+        legacyFogDensity: 0.00062,
+        fogHeightFalloff: 0.0035,
+        fogBase: -25,
+        fogWarmPow: 5,
+        exposure: 1.2,
+        bloomScale: 0.9,
+        bloomRadius: 0.55,
+        bloomThreshold: 2.2,
+        shadowHalf: 120,
+        envInterval: 3
+    };
     const XM_STATE = { ground: null, grid: null, rockProtos: null, rocksFailed: false, baked: new Map() };
+    const XM_RT = {
+        tier: "high", q: XM.QUALITY.high, mode: 0, governor: null, normals: null,
+        fog: null, sky: null, env: null, post: null, postModules: null, postLoading: false, postFailed: false,
+        atmosphereOn: false, applied: false, failed: false, terrainPatch: null, state: null,
+        lastT: 0, time: 0, envT: 0, rider: null, wind: [0, 0, 0], lastPos: null,
+        saddle: null, gait: null, tmp: new THREE.Vector3(),
+        legacyBackground: 0xc7d5ad
+    };
+    function xmGlow(value, scale = 6) {
+        return XM_FX.enabled && XM_RT.q && XM_RT.q.bloom ? value * scale : value;
+    }
+
+    /* ───────── 地形 ───────── */
     function rebuildGround(seed) {
         XM_STATE.ground = null;
         XM_STATE.grid = null;
@@ -3939,18 +4744,20 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
     function createTerrain() {
         if (XM_STATE.grid) {
             try {
+                const blend = !!(XM_FX.enabled && XM_RT.q.atmosphere && !XM_RT.failed);
                 const data = XM.buildTerrain(XM_STATE.ground, {
                     axis: XM_STATE.grid.axis,
                     heights: XM_STATE.grid.heights,
                     gridNormals: true,
+                    splat: blend,
                     cavity: false
                 });
-                const terrain = XM.createTerrainMesh(THREE, data, {
-                    material: new THREE.MeshStandardMaterial({
-                        vertexColors: true,
-                        roughness: 1
-                    })
+                const material = new THREE.MeshStandardMaterial({
+                    vertexColors: true,
+                    roughness: 1
                 });
+                XM_RT.terrainPatch = blend ? XM.patchTerrainMaterial(THREE, material, XM_STATE.ground.palette) : null;
+                const terrain = XM.createTerrainMesh(THREE, data, { material });
                 worldGroup.add(terrain);
                 const m = XM_CFG.mountains;
                 const layers = XM.MOUNTAIN_LAYERS.map(layer => ({
@@ -3972,6 +4779,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
                 console.error("新地形网格生成失败，已回退旧地形：", error);
                 XM_STATE.grid = null;
                 XM_STATE.ground = null;
+                XM_RT.terrainPatch = null;
             }
         }
         createTerrainLegacy();
@@ -4020,18 +4828,34 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
             propGroup.add(rock);
         }
     }
+
+    /* ───────── 人物：蒙皮 + PBR + 程序化呼吸/眨眼 + 布料/长发仿真 ───────── */
     function getBakedFigure(kind, ride) {
-        const key = kind + (ride ? ":ride" : ":stand");
+        const key = kind + (ride ? ":ride" : ":stand") + (XM_FX.physics ? "" : ":static");
         let baked = XM_STATE.baked.get(key);
         if (!baked) {
             let data = XM.buildCharacterData({ kind });
             if (ride) {
                 data = XM.poseData(data, XM.RIDE_POSE);
             }
-            baked = XM.bakeCharacter(data, { colorScale: XM_CFG.colorScale });
+            baked = XM.bakeCharacter(data, {
+                colorScale: XM_CFG.colorScale,
+                dynamic: !XM_FX.physics ? [] : ride ? ["cape", "tails", "hair"] : ["cape", "tails", "drape", "hair"],
+                legsColliders: !ride
+            });
             XM_STATE.baked.set(key, baked);
         }
         return baked;
+    }
+    function xmHorseCollider(hs, rideY) {
+        // 把坐骑身体（胶囊，沿 X）从坐骑空间换算到骑手模型空间：减去锚点与骑手偏移，再做 -π/2 的 Y 旋转并除以尺度
+        const toModel = (q) => {
+            const ax = q[0] - XM_CFG.anchor[0];
+            const ay = q[1] - XM_CFG.anchor[1] - rideY;
+            const az = q[2] - XM_CFG.anchor[2];
+            return [-az / hs, ay / hs, ax / hs];
+        };
+        return { tag: "horse", a: toModel([-0.95, 1.55, 0]), b: toModel([0.95, 1.55, 0]), r: 0.58 / hs };
     }
     function createCharacterFigure(character, scale = 1, options = {}) {
         // 外层：缩放（队伍/骑手代码会改它的位置与朝向）；内层：把"朝 +Z"的人物转成游戏统一的"朝本地 +X"。
@@ -4045,24 +4869,470 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         if (kind) {
             try {
                 const baked = getBakedFigure(kind, !!options.ride);
-                const figure = XM.createStaticCharacter(THREE, baked, { castShadow: true });
+                const matOpts = XM_FX.enabled && XM_FX.pbr ? { normalMaps: XM_RT.normals, env: XM_RT.env } : {};
+                const figure = XM.createSkinnedBaked(THREE, baked, { castShadow: true, ...matOpts });
+                const hs = XM_CFG.unit * scale;
                 figure.group.scale.setScalar(XM_CFG.unit);
                 inner.add(figure.group);
                 usedNew = true;
+                let rideY = 0;
                 if (options.ride) {
-                    const seat =
-                        (baked.layout.hipY - 0.10 * baked.layout.k) * XM_CFG.unit * scale;
-                    outer.userData.rideY = XM_CFG.saddleTop - XM_CFG.anchorY - seat;
+                    const seat = (baked.layout.hipY - 0.10 * baked.layout.k) * hs;
+                    rideY = XM_CFG.saddleTop - XM_CFG.anchor[1] - seat;
+                    outer.userData.rideY = rideY;
+                    outer.userData.seatH = seat;
                 }
+                const rig = new XM.ClothRig();
+                figure.dynamic.forEach(entry => rig.add(entry, {
+                    colliders: baked.colliders,
+                    extraColliders: options.ride ? [xmHorseCollider(hs, rideY)] : []
+                }));
+                outer.userData.xm = {
+                    fig: figure,
+                    rig,
+                    idle: new XM.IdleAnimator(XM.hashStr(character.id + (options.ride ? "r" : "s"))),
+                    k: baked.layout.k,
+                    ride: !!options.ride,
+                    headCounter: 0
+                };
             } catch (error) {
                 console.error("新人物模型生成失败，已回退旧模型：", character.id, error);
+                inner.clear();
+                delete outer.userData.xm;
             }
         }
         if (!usedNew) {
             inner.add(createCharacterFigureLegacy(character, 1));
         }
+        if (options.ride) {
+            // 骑手换人时：新模型骑手接管跟随/待机更新，旧模型骑手则清空引用，避免继续更新一个已被移除的模型
+            XM_RT.rider = usedNew && outer.userData.xm ? outer : null;
+            if (XM_RT.saddle) {
+                XM_RT.saddle.reset();
+            }
+        }
         outer.userData.characterId = character.id;
         return outer;
+    }
+    function xmDisposeFigure(group) {
+        if (!group) {
+            return;
+        }
+        if (XM_RT.rider === group) {
+            XM_RT.rider = null;
+        }
+        group.traverse(object => {
+            if (object.geometry) {
+                object.geometry.dispose();
+            }
+            if (object.material && object.material.dispose) {
+                object.material.dispose();
+            }
+        });
+    }
+    function xmUpdateFigure(group, delta, moving) {
+        const xm = group.userData.xm;
+        if (!xm) {
+            return;
+        }
+        try {
+            if (XM_FX.enabled && XM_FX.idle) {
+                const pose = xm.idle.update(delta, !moving);
+                if (xm.ride) {
+                    pose.head[0] += xm.headCounter;
+                }
+                XM.applyIdlePose(xm.fig, pose, xm.k);
+            }
+            if (XM_FX.enabled && XM_FX.physics && XM_RT.q.cloth && xm.rig.items.length) {
+                group.getWorldPosition(XM_RT.tmp);
+                const far = XM_RT.tmp.distanceToSquared(camera.position) > 150 * 150;
+                XM.windAt(XM_RT.time, XM_RT.tmp.x, XM_RT.tmp.z, XM_FX.windStrength, XM_RT.wind);
+                xm.rig.update(delta, XM_RT.wind, far);
+            }
+        } catch (error) {
+            console.error("人物动态更新失败，已停用该角色的动态效果：", error);
+            delete group.userData.xm;
+        }
+    }
+    function xmUpdateFigures(delta) {
+        if (!XM_FX.enabled) {
+            return;
+        }
+        XM_RT.time += delta;
+        const moving = !!player.moving;
+        if (XM_RT.rider) {
+            xmUpdateFigure(XM_RT.rider, delta, moving);
+        }
+        for (const companion of companions) {
+            xmUpdateFigure(companion.group, delta, moving);
+        }
+    }
+
+    /* ───────── 白龙马：髋/膝两段腿 + 四蹄步态 + 骑手鞍座阻尼跟随 ───────── */
+    function xmBuildHorseLeg(mount, front, side, legMaterial) {
+        if (!(XM_FX.enabled && XM_FX.rideDynamics)) {
+            const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.14, 1.35, 5), legMaterial);
+            leg.position.set(front * 0.55, 0.78, side * 0.42);
+            leg.castShadow = true;
+            mount.userData.legs.push(leg);
+            return leg;
+        }
+        const hip = new THREE.Group();
+        hip.position.set(front * 0.55, 1.45, side * 0.42);
+        const upper = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.115, 0.72, 6), legMaterial);
+        upper.position.y = -0.36;
+        upper.castShadow = true;
+        hip.add(upper);
+        const knee = new THREE.Group();
+        knee.position.y = -0.72;
+        hip.add(knee);
+        const lower = new THREE.Mesh(new THREE.CylinderGeometry(0.105, 0.075, 0.64, 6), legMaterial);
+        lower.position.y = -0.32;
+        lower.castShadow = true;
+        knee.add(lower);
+        const hoof = new THREE.Mesh(new THREE.BoxGeometry(0.20, 0.10, 0.20), makeCharacterMaterial(0x4a3b32));
+        hoof.position.y = -0.66;
+        hoof.castShadow = true;
+        knee.add(hoof);
+        hip.userData.knee = knee;
+        mount.userData.legs.push(hip);
+        return hip;
+    }
+    function animatePlayerModel(delta, moving) {
+        const mount = playerGroup.userData.mount;
+        if (!mount || !(XM_FX.enabled && XM_FX.rideDynamics) || !mount.userData.legs[0] || !mount.userData.legs[0].userData.knee) {
+            animatePlayerModelLegacy(delta, moving);
+            return;
+        }
+        try {
+            xmAnimateRide(mount, delta, moving);
+        } catch (error) {
+            console.error("坐骑动态出错，已回退旧步态：", error);
+            XM_FX.rideDynamics = false;
+            animatePlayerModelLegacy(delta, moving);
+        }
+    }
+    function xmAnimateRide(mount, delta, moving) {
+        if (!XM_RT.gait) {
+            XM_RT.gait = new XM.GaitModel();
+            XM_RT.saddle = new XM.SaddleFollow();
+        }
+        const P = playerGroup.position;
+        let speed = 0;
+        if (XM_RT.lastPos) {
+            speed = Math.hypot(P.x - XM_RT.lastPos.x, P.z - XM_RT.lastPos.z) / Math.max(delta, 1e-4);
+            if (speed > 80) {
+                speed = 0;
+            }
+        } else {
+            XM_RT.lastPos = new THREE.Vector3();
+        }
+        XM_RT.lastPos.copy(P);
+        const gait = XM_RT.gait.step(delta, speed, moving);
+        mount.userData.legs.forEach((hip, index) => {
+            hip.rotation.z = gait.legs[index].hip;
+            hip.userData.knee.rotation.z = gait.legs[index].knee;
+        });
+        mount.position.y = gait.bob;
+        mount.rotation.z = gait.pitch;
+        mount.rotation.x = gait.roll;
+        const rider = XM_RT.rider;
+        if (rider && rider.userData.xm && rider.parent === mount.userData.riderAnchor) {
+            const follow = XM_RT.saddle.step(delta, gait.bob, gait.pitch);
+            const seat = rider.userData.seatH || 1.1;
+            rider.rotation.z = follow.dpitch;
+            rider.position.x = seat * Math.sin(follow.dpitch);
+            rider.position.y = rider.userData.rideY + follow.dy + seat * (1 - Math.cos(follow.dpitch));
+            rider.userData.xm.headCounter = 0.5 * (gait.pitch + follow.dpitch);
+        }
+    }
+
+    /* ───────── 光影：高度雾 / 天空穹顶 / 昼夜调色板 / 4096 阴影 / 后期 ───────── */
+    function xmDirtyMaterials() {
+        scene.traverse(object => {
+            const m = object.material;
+            if (m) {
+                (Array.isArray(m) ? m : [m]).forEach(item => { item.needsUpdate = true; });
+            }
+        });
+    }
+    function xmEnableAtmosphere() {
+        if (XM_RT.atmosphereOn) {
+            return;
+        }
+        XM_RT.fog = XM_RT.fog && XM_RT.fog.active ? XM_RT.fog : XM.installHeightFog(THREE);
+        if (!XM_RT.sky) {
+            XM_RT.sky = XM.createSkyDome(THREE, { radius: 1000 });
+        }
+        scene.add(XM_RT.sky.mesh);
+        scene.fog.density = XM_FX.fogDensity;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = XM_FX.exposure;
+        if (!XM_RT.env && XM_RT.q.env) {
+            XM_RT.env = XM.createEnvironment(THREE, renderer, XM_RT.sky);
+        }
+        XM_RT.atmosphereOn = true;
+        XM_RT.applied = false;
+        xmDirtyMaterials();
+    }
+    function xmDisableAtmosphere() {
+        if (!XM_RT.atmosphereOn) {
+            return;
+        }
+        if (XM_RT.fog) {
+            XM_RT.fog.restore();
+        }
+        if (XM_RT.sky) {
+            scene.remove(XM_RT.sky.mesh);
+        }
+        scene.fog.density = XM_FX.legacyFogDensity;
+        renderer.toneMapping = THREE.NoToneMapping;
+        renderer.toneMappingExposure = 1;
+        scene.background.set(XM_RT.legacyBackground);
+        scene.fog.color.set(XM_RT.legacyBackground);
+        XM_RT.atmosphereOn = false;
+        xmDirtyMaterials();
+    }
+    function xmRebuildPost() {
+        if (XM_RT.post) {
+            XM_RT.post.dispose();
+            XM_RT.post = null;
+        }
+        if (!XM_RT.q.post || !XM_RT.postModules || XM_RT.failed || !XM_RT.atmosphereOn) {
+            return;
+        }
+        try {
+            XM_RT.post = XM.createPostPipeline(THREE, XM_RT.postModules, renderer, scene, camera, {
+                ssao: XM_RT.q.ssao,
+                bloom: XM_RT.q.bloom,
+                msaa: XM_RT.q.msaa,
+                bloomStrength: 0.4 * XM_FX.bloomScale,
+                bloomRadius: XM_FX.bloomRadius,
+                bloomThreshold: XM_FX.bloomThreshold
+            });
+        } catch (error) {
+            console.error("后期处理管线创建失败，保持直接渲染：", error);
+            XM_RT.post = null;
+            XM_RT.postFailed = true;
+        }
+    }
+    async function xmLoadPost() {
+        if (XM_RT.postLoading || XM_RT.postModules || XM_RT.postFailed) {
+            return;
+        }
+        XM_RT.postLoading = true;
+        try {
+            const base = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/postprocessing/";
+            const loaded = await Promise.all([
+                xmImport(base + "EffectComposer.js"),
+                xmImport(base + "RenderPass.js"),
+                xmImport(base + "UnrealBloomPass.js"),
+                xmImport(base + "SSAOPass.js"),
+                xmImport(base + "OutputPass.js")
+            ]);
+            XM_RT.postModules = {
+                EffectComposer: loaded[0].EffectComposer,
+                RenderPass: loaded[1].RenderPass,
+                UnrealBloomPass: loaded[2].UnrealBloomPass,
+                SSAOPass: loaded[3].SSAOPass,
+                OutputPass: loaded[4].OutputPass
+            };
+            xmRebuildPost();
+        } catch (error) {
+            XM_RT.postFailed = true;
+            console.error("后期处理模块加载失败，保持直接渲染：", error);
+        } finally {
+            XM_RT.postLoading = false;
+        }
+    }
+    function xmApplyTier(tier) {
+        XM_RT.tier = tier;
+        const q = XM.QUALITY[tier];
+        XM_RT.q = q;
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, q.pixelRatioMax));
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        const half = XM_FX.shadowHalf;
+        const cam = sun.shadow.camera;
+        cam.left = -half;
+        cam.right = half;
+        cam.top = half;
+        cam.bottom = -half;
+        cam.near = 1;
+        cam.far = 1200;
+        cam.updateProjectionMatrix();
+        sun.shadow.bias = -0.0005;
+        sun.shadow.normalBias = 0.04;
+        if (sun.shadow.mapSize.x !== q.shadow) {
+            sun.shadow.mapSize.set(q.shadow, q.shadow);
+            if (sun.shadow.map) {
+                sun.shadow.map.dispose();
+                sun.shadow.map = null;
+            }
+        }
+        if (q.atmosphere && !XM_RT.failed) {
+            xmEnableAtmosphere();
+        } else {
+            xmDisableAtmosphere();
+        }
+        xmRebuildPost();
+        if (q.post && !XM_RT.postModules) {
+            xmLoadPost();
+        }
+    }
+    function xmRollback() {
+        XM_RT.failed = true;
+        try {
+            if (XM_RT.terrainPatch) {
+                XM_RT.terrainPatch.revert();
+                XM_RT.terrainPatch = null;
+            }
+            xmDisableAtmosphere();
+            if (XM_RT.post) {
+                XM_RT.post.dispose();
+                XM_RT.post = null;
+            }
+            XM_RT.tier = "low";
+            XM_RT.q = XM.QUALITY.low;
+        } catch (error) {
+            console.error("光影回退时出错：", error);
+        }
+    }
+    function xmSetupFX() {
+        XM_RT.normals = XM.makeNormalTextureFactory(THREE);
+        let tier = "high";
+        let locked = false;
+        const wanted = XM_QS && XM_QS.get("quality");
+        if (wanted && XM.TIERS.includes(wanted)) {
+            tier = wanted;
+            locked = true;
+        } else if (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0 && Math.min(window.innerWidth, window.innerHeight) < 900) {
+            tier = "medium";
+        }
+        XM_RT.governor = new XM.QualityGovernor(tier, { locked });
+        XM_RT.mode = locked ? XM.TIERS.indexOf(tier) : 3;
+        XM_RT.tier = tier;
+        XM_RT.q = XM.QUALITY[tier];
+        if (!XM_FX.enabled) {
+            return;
+        }
+        try {
+            renderer.debug.onShaderError = () => {
+                console.error("着色器编译失败，已回退到内置画面");
+                xmRollback();
+            };
+            window.addEventListener("resize", () => {
+                if (XM_RT.post) {
+                    XM_RT.post.setSize(window.innerWidth, window.innerHeight);
+                }
+            });
+            scene.add(sun.target);
+            xmApplyTier(tier);
+        } catch (error) {
+            console.error("光影系统初始化失败，已回退旧画面：", error);
+            xmRollback();
+        }
+    }
+    function xmApplyAtmosphere(delta) {
+        const st = XM.atmosphereAt(dayTime);
+        XM_RT.state = st;
+        const L = st.lightDir;
+        sun.color.setRGB(st.lightColor[0], st.lightColor[1], st.lightColor[2]);
+        sun.intensity = st.lightIntensity;
+        ambientLight.color.setRGB(st.hemiSky[0], st.hemiSky[1], st.hemiSky[2]);
+        ambientLight.groundColor.setRGB(st.hemiGround[0], st.hemiGround[1], st.hemiGround[2]);
+        ambientLight.intensity = st.hemiIntensity;
+        scene.background.setRGB(st.fogColor[0], st.fogColor[1], st.fogColor[2]);
+        scene.fog.color.setRGB(st.fogColor[0], st.fogColor[1], st.fogColor[2]);
+        const focus = playerGroup.position;
+        const texel = (2 * XM_FX.shadowHalf) / sun.shadow.mapSize.x;
+        const t = XM.snapToTexel([focus.x, focus.y, focus.z], L, texel);
+        sun.target.position.set(t[0], t[1], t[2]);
+        sun.position.set(t[0] + L[0] * 500, t[1] + L[1] * 500, t[2] + L[2] * 500);
+        sun.target.updateMatrixWorld();
+        XM_RT.fog.set({
+            heightFalloff: XM_FX.fogHeightFalloff,
+            baseHeight: XM_FX.fogBase,
+            warmAmt: st.warmAmt,
+            warmPow: XM_FX.fogWarmPow,
+            sunDir: st.sunDir,
+            warm: st.warmColor
+        });
+        XM_RT.sky.set(st);
+        XM_RT.sky.mesh.position.copy(camera.position);
+        renderer.toneMappingExposure = XM_FX.exposure * st.exposure;
+        if (XM_RT.post && XM_RT.post.bloom) {
+            XM_RT.post.bloom.strength = st.bloom * XM_FX.bloomScale;
+        }
+        if (XM_RT.env) {
+            XM_RT.envT -= delta;
+            if (XM_RT.envT <= 0 || !XM_RT.applied) {
+                XM_RT.envT = XM_FX.envInterval;
+                XM_RT.env.refresh();
+            }
+        }
+        XM_RT.applied = true;
+    }
+    function updateDayNight(delta) {
+        if (!XM_FX.enabled || !XM_RT.atmosphereOn || XM_RT.failed) {
+            updateDayNightLegacy(delta);
+            return;
+        }
+        dayTime += delta * 0.002;
+        try {
+            xmApplyAtmosphere(delta);
+        } catch (error) {
+            console.error("昼夜光影更新失败，已回退旧逻辑：", error);
+            xmRollback();
+        }
+    }
+    function xmRender() {
+        if (!XM_FX.enabled) {
+            renderer.render(scene, camera);
+            return;
+        }
+        const now = performance.now();
+        if (XM_RT.lastT && XM_RT.governor) {
+            const next = XM_RT.governor.update(now - XM_RT.lastT);
+            if (next && !XM_RT.failed) {
+                xmApplyTier(next);
+            }
+        }
+        XM_RT.lastT = now;
+        if (XM_RT.atmosphereOn && !XM_RT.applied && !XM_RT.failed) {
+            try {
+                xmApplyAtmosphere(0);
+            } catch (error) {
+                console.error("光影首帧应用失败：", error);
+                xmRollback();
+            }
+        }
+        if (XM_RT.post && XM_RT.q.post && !XM_RT.failed) {
+            try {
+                XM_RT.post.render();
+                return;
+            } catch (error) {
+                console.error("后期渲染出错，已关闭后期：", error);
+                XM_RT.post = null;
+                XM_RT.postFailed = true;
+            }
+        }
+        renderer.render(scene, camera);
+    }
+    function xmCycleQuality() {
+        const order = ["high", "medium", "low", "auto"];
+        XM_RT.mode = (XM_RT.mode + 1) % order.length;
+        const pick = order[XM_RT.mode];
+        const labels = { high: "高", medium: "中", low: "低", auto: "自动" };
+        if (XM_RT.failed) {
+            return "画质：内置（特效已回退）";
+        }
+        if (pick === "auto") {
+            XM_RT.governor.locked = false;
+        } else {
+            XM_RT.governor.setTier(pick, true);
+            xmApplyTier(pick);
+        }
+        return "画质：" + labels[pick] + (pick === "auto" ? "（" + { high: "高", medium: "中", low: "低" }[XM_RT.tier] + "）" : "");
     }
 
     /*
@@ -4183,6 +5453,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
     worldGroup.add(eventGroup);
 
     scene.add(worldGroup);
+    xmSetupFX();
 
     let rngSeed = 0;
     let rngState = 0;
@@ -4763,7 +6034,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         roofRed: new THREE.MeshStandardMaterial({ color: 0x9c3a2f, roughness: 0.9 }),
         stone: new THREE.MeshStandardMaterial({ color: 0x9a9a92, roughness: 1 }),
         gold: new THREE.MeshStandardMaterial({ color: 0xe0b85a, roughness: 0.5, emissive: 0x3a2a08 }),
-        lamp: new THREE.MeshStandardMaterial({ color: 0xff7a3a, emissive: 0xff5a1a, emissiveIntensity: 0.8 })
+        lamp: new THREE.MeshStandardMaterial({ color: 0xff7a3a, emissive: 0xff5a1a, emissiveIntensity: xmGlow(0.8, 6) })
     };
 
     function bMesh(geometry, material, x, y, z) {
@@ -5295,14 +6566,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
 
         for (const side of [-1, 1]) {
             for (const front of [-1, 1]) {
-                const leg = new THREE.Mesh(
-                    new THREE.CylinderGeometry(0.10, 0.14, 1.35, 5),
-                    legMaterial
-                );
-                leg.position.set(front * 0.55, 0.78, side * 0.42);
-                leg.castShadow = true;
-                mount.add(leg);
-                mount.userData.legs.push(leg);
+                mount.add(xmBuildHorseLeg(mount, front, side, legMaterial));
             }
         }
 
@@ -5354,7 +6618,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         activeRiderCharacter = character;
     }
 
-    function animatePlayerModel(delta, moving) {
+    function animatePlayerModelLegacy(delta, moving) {
         const mount = playerGroup.userData.mount;
         if (!mount) return;
 
@@ -5665,6 +6929,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         companions.length = 0;
 
         for (let i = npcGroup.children.length - 1; i >= 0; i--) {
+            xmDisposeFigure(npcGroup.children[i]);
             npcGroup.remove(npcGroup.children[i]);
         }
 
@@ -6125,7 +7390,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
             new THREE.MeshStandardMaterial({
                 color,
                 emissive: color,
-                emissiveIntensity: type === "spirit" ? 0.25 : 0.04
+                emissiveIntensity: xmGlow(type === "spirit" ? 0.25 : 0.04, 14)
             })
         );
 
@@ -6365,7 +7630,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
                     type === "shrine"
                         ? 0x6d4214
                         : 0x243744,
-                emissiveIntensity: 0.8
+                emissiveIntensity: xmGlow(0.8, 6)
             })
         );
 
@@ -8461,7 +9726,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
     });
     $el("settingsButton").addEventListener("click", () => {
         const b = $el("settingsButton");
-        b.textContent = "设置（敬请期待）";
+        b.textContent = xmCycleQuality();
         setTimeout(() => { b.innerHTML = "<span>⚙</span> 设置"; }, 1600);
     });
 
@@ -8719,7 +9984,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
 
     let dayTime = 0.25;
 
-    function updateDayNight(delta) {
+    function updateDayNightLegacy(delta) {
         dayTime += delta * 0.002;
 
         if (dayTime > 1) {
@@ -8811,12 +10076,13 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
 
         if (openingState) {
             updateOpening(delta);
-            renderer.render(scene, camera);
+            xmRender();
             return;
         }
 
         updatePlayer(delta);
         updateCompanions(delta);
+        xmUpdateFigures(delta);
         updateOtherParties(delta);
         updateCamera(delta);
         updateMessage(delta);
@@ -8831,10 +10097,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
             mapCanvas.height
         );
 
-        renderer.render(
-            scene,
-            camera
-        );
+        xmRender();
     }
 
     /*
