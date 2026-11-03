@@ -5478,11 +5478,13 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
     const worldGroup = new THREE.Group();
     const roadGroup = new THREE.Group();
     const propGroup = new THREE.Group();
+    const grassGroup = new THREE.Group();
     const npcGroup = new THREE.Group();
     const eventGroup = new THREE.Group();
 
     worldGroup.add(roadGroup);
     worldGroup.add(propGroup);
+    worldGroup.add(grassGroup);
     worldGroup.add(npcGroup);
     worldGroup.add(eventGroup);
 
@@ -5919,6 +5921,111 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         ============================================================
     */
 
+    const grassRuntime = { meshes: [], time: 0 };
+
+    function createGrassField() {
+        clearGroup(grassGroup);
+        grassRuntime.meshes = [];
+        const material = new THREE.ShaderMaterial({
+            uniforms: {
+                uTime: { value: 0 },
+                uWind: { value: new THREE.Vector2(0.62, 0.78) },
+                uColor: { value: new THREE.Color(0xb69b4c) }
+            },
+            vertexShader: `
+                attribute vec3 instanceColor;
+                uniform float uTime;
+                uniform vec2 uWind;
+                varying float vTip;
+                varying vec3 vColor;
+                void main() {
+                    vec3 p = position;
+                    float tip = clamp(p.y, 0.0, 1.0);
+                    float phase = instanceMatrix[3].x * 0.17 + instanceMatrix[3].z * 0.11;
+                    float sway = sin(uTime * 1.8 + phase) * 0.08 + sin(uTime * 0.73 + phase * 1.7) * 0.04;
+                    p.x += uWind.x * sway * tip * tip;
+                    p.z += uWind.y * sway * tip * tip;
+                    vec4 world = modelMatrix * instanceMatrix * vec4(p, 1.0);
+                    gl_Position = projectionMatrix * viewMatrix * world;
+                    vTip = tip;
+                    vColor = instanceColor;
+                }
+            `,
+            fragmentShader: `
+                varying float vTip;
+                varying vec3 vColor;
+                void main() {
+                    vec3 color = mix(vColor * 0.58, vColor * 1.28, vTip);
+                    float alpha = smoothstep(0.02, 0.16, vTip);
+                    if (alpha < 0.22) discard;
+                    gl_FragColor = vec4(color, 1.0);
+                }
+            `,
+            side: THREE.DoubleSide,
+            transparent: false,
+            alphaTest: 0.22,
+            depthWrite: true
+        });
+        const blade = new THREE.PlaneGeometry(0.16, 1, 1, 2);
+        blade.translate(0, 0.5, 0);
+        const rng = XM.mulberry32((rngSeed ^ 0x5f3759df) >>> 0);
+        const count = XM_RT.q && XM_RT.q.pixelRatioMax <= 1 ? 900 : 1500;
+        const colors = [
+            new THREE.Color(0x77652d),
+            new THREE.Color(0xa58b40),
+            new THREE.Color(0xc5aa5e),
+            new THREE.Color(0x5d6b32)
+        ];
+        const layers = [
+            { count, height: [0.55, 1.35], radius: CONFIG.worldHalf - 20, scale: 1 },
+            { count: Math.floor(count * 0.42), height: [0.9, 1.9], radius: CONFIG.worldHalf - 45, scale: 1.35 }
+        ];
+        for (const layer of layers) {
+            const mesh = new THREE.InstancedMesh(blade, material, layer.count);
+            mesh.name = "procedural-grass";
+            mesh.frustumCulled = false;
+            mesh.receiveShadow = true;
+            const matrix = new THREE.Matrix4();
+            const color = new THREE.Color();
+            for (let i = 0; i < layer.count; i++) {
+                const angle = rng() * Math.PI * 2;
+                const radius = Math.sqrt(rng()) * layer.radius;
+                const x = Math.cos(angle) * radius;
+                const z = Math.sin(angle) * radius;
+                if (Math.abs(x) < 52 && Math.abs(z) < 52) {
+                    i--;
+                    continue;
+                }
+                const h = randomRange(layer.height[0], layer.height[1]) * layer.scale;
+                matrix.identity();
+                matrix.setPosition(x, terrainHeight(x, z) + 0.02, z);
+                const sx = 0.7 + rng() * 0.7;
+                const sz = 0.7 + rng() * 0.7;
+                matrix.elements = [
+                    sx, 0, 0, 0,
+                    0, h, 0, 0,
+                    0, 0, sz, 0,
+                    x, terrainHeight(x, z) + 0.02, z, 1
+                ];
+                mesh.setMatrixAt(i, matrix);
+                color.copy(colors[Math.floor(rng() * colors.length)]);
+                mesh.setColorAt(i, color);
+            }
+            mesh.instanceMatrix.needsUpdate = true;
+            if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+            grassGroup.add(mesh);
+            grassRuntime.meshes.push(mesh);
+        }
+    }
+
+    function updateGrass(delta) {
+        if (!grassRuntime.meshes.length) return;
+        grassRuntime.time += delta;
+        for (const mesh of grassRuntime.meshes) {
+            mesh.material.uniforms.uTime.value = grassRuntime.time;
+        }
+    }
+
     function createTree(x, z, scale = 1) {
         const group = new THREE.Group();
 
@@ -5939,26 +6046,26 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
 
         group.add(trunk);
 
-        const crown = new THREE.Mesh(
-            new THREE.IcosahedronGeometry(
-                4.2 * scale,
-                1
-            ),
-            new THREE.MeshStandardMaterial({
-                color: choose([
-                    0xc58fa5,
-                    0xd09aad,
-                    0xb98299,
-                    0xd3a7b4
-                ]),
-                roughness: 1
-            })
-        );
-
-        crown.position.y = 8.0 * scale;
-        crown.castShadow = true;
-
-        group.add(crown);
+        const crownMaterial = new THREE.MeshStandardMaterial({
+            color: choose([0xb8833d, 0xc99a43, 0xd3aa54, 0xa97736]),
+            roughness: 1
+        });
+        const crownShape = new THREE.IcosahedronGeometry(3.2 * scale, 1);
+        const crownOffsets = [
+            [-1.6, 6.8, 0.2, 1.0, 0.9, 1.0],
+            [1.5, 7.3, -0.3, 1.1, 1.0, 0.9],
+            [0, 9.0, 0, 1.25, 1.1, 1.0],
+            [-0.8, 8.2, 1.4, 0.9, 0.85, 0.8],
+            [0.9, 8.4, -1.2, 0.95, 0.9, 0.85]
+        ];
+        for (const [ox, oy, oz, sx, sy, sz] of crownOffsets) {
+            const crown = new THREE.Mesh(crownShape, crownMaterial);
+            crown.position.set(ox * scale, oy * scale, oz * scale);
+            crown.scale.set(sx, sy, sz);
+            crown.rotation.y = (ox + oz) * 0.3;
+            crown.castShadow = true;
+            group.add(crown);
+        }
 
         group.position.set(
             x,
@@ -6108,6 +6215,18 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
             }
         }
         g.add(bMesh(new THREE.BoxGeometry(1.8, 2.8, 0.3), BM.wood, 0, 2.4, d / 2 + 0.05));
+        const windowMaterial = new THREE.MeshStandardMaterial({
+            color: 0x2a2119,
+            emissive: 0x6e3f1d,
+            emissiveIntensity: inn ? xmGlow(0.18, 3) : xmGlow(0.08, 2)
+        });
+        const windowRows = Math.max(1, floors);
+        for (let f = 0; f < windowRows; f++) {
+            const y = 3.0 + f * 4.2;
+            for (const sx of [-1, 1]) {
+                g.add(bMesh(new THREE.BoxGeometry(1.35, 1.15, 0.12), windowMaterial, sx * (w * 0.25), y, d / 2 + 0.08));
+            }
+        }
         g.add(bRoof(w, d, 3.6, inn ? BM.roofRed : BM.roof, 1 + h));
         if (inn) {
             for (const sx of [-1, 1]) {
@@ -6254,6 +6373,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
 
     function populateWorld() {
         clearGroup(propGroup);
+        createGrassField();
 
         for (let i = 0; i < 380; i++) {
             const x = randomRange(
@@ -9448,12 +9568,14 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
 
         worldGroup.add(roadGroup);
         worldGroup.add(propGroup);
+        worldGroup.add(grassGroup);
         worldGroup.add(npcGroup);
         worldGroup.add(eventGroup);
         worldGroup.add(buildingGroup);
 
         clearGroup(roadGroup);
         clearGroup(propGroup);
+        clearGroup(grassGroup);
         clearGroup(npcGroup);
         clearGroup(eventGroup);
 
@@ -10122,6 +10244,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         updatePlayer(delta);
         updateCompanions(delta);
         xmUpdateFigures(delta);
+        updateGrass(delta);
         updateOtherParties(delta);
         updateCamera(delta);
         updateMessage(delta);
