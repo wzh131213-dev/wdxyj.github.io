@@ -1820,6 +1820,30 @@
             background: rgba(8, 12, 16, .68);
         }
 
+        #qualityButton {
+            position: fixed;
+            top: 176px;
+            right: 14px;
+            z-index: 8;
+            padding: 7px 11px;
+            border: 1px solid rgba(255,255,255,.16);
+            border-radius: 8px;
+            background: rgba(8, 12, 16, .72);
+            color: #efe6cf;
+            font: inherit;
+            font-size: 11px;
+            cursor: pointer;
+            pointer-events: auto;
+            touch-action: manipulation;
+        }
+
+        #qualityButton:hover,
+        #qualityButton:active {
+            border-color: rgba(224,190,112,.72);
+            background: rgba(80, 60, 28, .82);
+            color: #fff4d0;
+        }
+
         #hud #mapCanvas {
             height: 125px !important;
             border-radius: 7px;
@@ -1935,6 +1959,11 @@
                 right: 9px !important;
             }
 
+            #qualityButton {
+                top: 142px;
+                right: 9px;
+            }
+
             #hud #mapCanvas {
                 height: 100px !important;
             }
@@ -2036,6 +2065,7 @@
             <span id="roadText">当前：荒野</span>
         </div>
     </div>
+    <button id="qualityButton" type="button" title="切换渲染画质">画质：自动</button>
 
     <div id="navigationPanel" class="hud-panel">
         <div id="navigationArrow" aria-label="导航方向">➤</div>
@@ -5293,7 +5323,7 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         const now = performance.now();
         if (XM_RT.lastT && XM_RT.governor) {
             const next = XM_RT.governor.update(now - XM_RT.lastT);
-            if (next && !XM_RT.failed) {
+            if (next) {
                 xmApplyTier(next);
             }
         }
@@ -5318,14 +5348,18 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         }
         renderer.render(scene, camera);
     }
+    function xmQualityLabel() {
+        const order = ["high", "medium", "low", "auto"];
+        const labels = { high: "高", medium: "中", low: "低", auto: "自动" };
+        const pick = order[XM_RT.mode] || "auto";
+        const suffix = pick === "auto" ? "（" + { high: "高", medium: "中", low: "低" }[XM_RT.tier] + "）" : "";
+        return "画质：" + labels[pick] + suffix + (XM_RT.failed ? "（内置特效）" : "");
+    }
     function xmCycleQuality() {
         const order = ["high", "medium", "low", "auto"];
         XM_RT.mode = (XM_RT.mode + 1) % order.length;
         const pick = order[XM_RT.mode];
         const labels = { high: "高", medium: "中", low: "低", auto: "自动" };
-        if (XM_RT.failed) {
-            return "画质：内置（特效已回退）";
-        }
         if (pick === "auto") {
             XM_RT.governor.locked = false;
         } else {
@@ -9728,6 +9762,11 @@ return { TAU, clamp, lerp, smoothstep, v3, mulberry32, hashStr, makeNoise, MeshB
         const b = $el("settingsButton");
         b.textContent = xmCycleQuality();
         setTimeout(() => { b.innerHTML = "<span>⚙</span> 设置"; }, 1600);
+    });
+    const qualityButton = $el("qualityButton");
+    qualityButton.textContent = xmQualityLabel();
+    qualityButton.addEventListener("click", e => {
+        e.currentTarget.textContent = xmCycleQuality();
     });
 
     /*
