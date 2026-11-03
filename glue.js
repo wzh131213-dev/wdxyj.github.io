@@ -693,13 +693,22 @@
         }
         renderer.render(scene, camera);
     }
+    function xmQualityLabel() {
+        if (XM_RT.failed) {
+            return "画质：内置";
+        }
+        const order = ["high", "medium", "low", "auto"];
+        const labels = { high: "高", medium: "中", low: "低", auto: "自动" };
+        const pick = order[XM_RT.mode] || "auto";
+        return "画质：" + labels[pick] + (pick === "auto" ? "（" + { high: "高", medium: "中", low: "低" }[XM_RT.tier] + "）" : "");
+    }
     function xmCycleQuality() {
         const order = ["high", "medium", "low", "auto"];
         XM_RT.mode = (XM_RT.mode + 1) % order.length;
         const pick = order[XM_RT.mode];
         const labels = { high: "高", medium: "中", low: "低", auto: "自动" };
         if (XM_RT.failed) {
-            return "画质：内置（特效已回退）";
+            return xmQualityLabel();
         }
         if (pick === "auto") {
             XM_RT.governor.locked = false;
